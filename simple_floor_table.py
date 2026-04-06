@@ -11,7 +11,8 @@ import omni.kit.commands
 import omni.usd
 from isaacsim.core.api import World
 from isaacsim.core.api.objects import DynamicCuboid, DynamicCylinder, DynamicSphere
-from isaacsim.core.prims import GeometryPrim
+from isaacsim.core.prims import GeometryPrim, SingleRigidPrim
+from isaacsim.core.utils.stage import add_reference_to_stage
 from isaacsim.core.utils.viewports import set_camera_view
 from isaacsim.sensors.camera import Camera
 from isaacsim.storage.native import get_assets_root_path
@@ -27,6 +28,12 @@ parser.add_argument(
 )
 parser.add_argument("--num-objects", type=int, default=6, help="Number of clutter objects to drop into the bin.")
 parser.add_argument("--seed", type=int, default=7, help="Deterministic seed for object placement.")
+parser.add_argument(
+    "--asset-root",
+    type=str,
+    default="C:/Users/Warra/Downloads/Assets/Isaac/5.1",
+    help="Local Isaac asset root containing the top-level Isaac folder.",
+)
 parser.add_argument(
     "--save-camera-debug",
     action="store_true",
@@ -141,6 +148,22 @@ def save_camera_debug(camera, output_dir):
         depth_normalized = (255.0 * (1.0 - depth_normalized)).astype(np.uint8)
         Image.fromarray(depth_normalized).save(os.path.join(output_dir, "realsense_depth_vis.png"))
 
+    print(f"[TopDownCamera] saved RGB and depth to {output_dir}")
+
+
+def resolve_asset_root(explicit_asset_root):
+    if explicit_asset_root and os.path.exists(os.path.join(explicit_asset_root, "Isaac")):
+        return explicit_asset_root
+
+    try:
+        detected_asset_root = get_assets_root_path()
+        if detected_asset_root and os.path.exists(os.path.join(detected_asset_root, "Isaac")):
+            return detected_asset_root
+    except Exception:
+        pass
+
+    return None
+
 
 def spawn_primitive_objects(world, rng, count, bin_center_y, table_surface_z):
     object_specs = [
@@ -204,16 +227,58 @@ def spawn_primitive_objects(world, rng, count, bin_center_y, table_surface_z):
     return spawned
 
 
-def spawn_objects(world, rng, source, count, bin_center_y, table_surface_z):
+def list_ycb_assets(asset_root):
+    ycb_dir = os.path.join(asset_root, "Isaac", "Props", "YCB", "Axis_Aligned_Physics")
+    if not os.path.exists(ycb_dir):
+        raise RuntimeError(f"YCB asset directory not found: {ycb_dir}")
+
+    entries = sorted(
+        [os.path.join(ycb_dir, name) for name in os.listdir(ycb_dir) if name.endswith(".usd") and not name.startswith(".")]
+    )
+    if not entries:
+        raise RuntimeError(f"No YCB USD files found in: {ycb_dir}")
+    return entries
+
+
+def spawn_ycb_objects(world, rng, count, asset_root, bin_center_y, table_surface_z):
+    ycb_assets = list_ycb_assets(asset_root)
+    spawned = []
+    drop_height = table_surface_z + 0.24
+
+    for idx in range(count):
+        usd_path = ycb_assets[idx % len(ycb_assets)]
+        prim_path = f"/World/Clutter/Object_{idx}"
+        add_reference_to_stage(usd_path=usd_path, prim_path=prim_path)
+
+        x = float(rng.uniform(-0.16, 0.16))
+        y = float(bin_center_y + rng.uniform(-0.08, 0.08))
+        z = float(drop_height + 0.05 * idx)
+        yaw = float(rng.uniform(0.0, 360.0))
+
+        rigid = world.scene.add(
+            SingleRigidPrim(
+                prim_path=prim_path,
+                name=f"ycb_object_{idx}",
+                position=np.array([x, y, z]),
+                orientation=rot_utils.euler_angles_to_quats(np.array([0.0, 0.0, yaw]), degrees=True),
+            )
+        )
+        spawned.append(rigid)
+
+    return spawned
+
+
+def spawn_objects(world, rng, source, count, asset_root, bin_center_y, table_surface_z):
     UsdGeom.Xform.Define(stage, "/World/Clutter")
 
     if source == "prims":
         return spawn_primitive_objects(world, rng, count, bin_center_y, table_surface_z)
+    if source == "ycb":
+        if asset_root is None:
+            raise RuntimeError("No Isaac asset root is available for YCB spawning.")
+        return spawn_ycb_objects(world, rng, count, asset_root, bin_center_y, table_surface_z)
 
-    raise RuntimeError(
-        "YCB spawning is not available in this install yet because the Isaac asset pack is missing. "
-        "Use --object-source prims for now, then switch to ycb once /Isaac/Props/YCB assets are installed."
-    )
+    raise RuntimeError(f"Unsupported object source: {source}")
 
 
 def objects_are_settled(objects, linear_threshold=0.03, angular_threshold=0.6):
@@ -238,10 +303,7 @@ UsdGeom.Xform.Define(stage, "/World/Table")
 UsdGeom.Xform.Define(stage, "/World/Bin")
 UsdGeom.Xform.Define(stage, "/World/Lights")
 
-try:
-    assets_root = get_assets_root_path()
-except Exception:
-    assets_root = None
+assets_root = resolve_asset_root(args.asset_root)
 marble_texture_path = None
 if assets_root:
     candidate = assets_root + "/Isaac/Samples/DR/Materials/Textures/marble_tile.png"
@@ -423,25 +485,36 @@ topdown_camera.set_opencv_pinhole_properties(
 
 apply_static_collision(floor_geom_paths + [str(top_prim.GetPath())] + table_leg_paths + bin_geom_paths)
 
-clutter_objects = spawn_objects(world, rng, args.object_source, args.num_objects, bin_center_y, table_surface_z)
+clutter_objects = spawn_objects(world, rng, args.object_source, args.num_objects, assets_root, bin_center_y, table_surface_z)
 
 settled = False
 settle_counter = 0
 settle_counter_target = 30
 capture_done = False
+frame_count = 0
+max_wait_frames = 600
+last_progress_frame = -1
 
 for _ in range(15):
     world.step(render=True)
 
 while simulation_app.is_running():
     world.step(render=True)
+    frame_count += 1
 
-    if not settled:
+    if not settled and not capture_done:
         if objects_are_settled(clutter_objects):
             settle_counter += 1
         else:
             settle_counter = 0
         settled = settle_counter >= settle_counter_target
+
+        if frame_count % 60 == 0 and frame_count != last_progress_frame:
+            print(
+                f"[TopDownCamera] waiting for clutter to settle "
+                f"(frame={frame_count}, stable_frames={settle_counter}/{settle_counter_target})"
+            )
+            last_progress_frame = frame_count
 
     if settled and not capture_done:
         save_camera_debug(topdown_camera, os.path.join(os.getcwd(), "camera_debug"))
@@ -449,5 +522,10 @@ while simulation_app.is_running():
 
         if args.save_camera_debug:
             print("[TopDownCamera] capture complete after clutter settled")
+
+    if not capture_done and frame_count >= max_wait_frames:
+        print("[TopDownCamera] settle timeout reached, capturing current frame")
+        save_camera_debug(topdown_camera, os.path.join(os.getcwd(), "camera_debug"))
+        capture_done = True
 
 simulation_app.close()
