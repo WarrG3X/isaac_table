@@ -68,6 +68,10 @@ Captured outputs are written to `camera_debug/` after the dropped objects settle
 
 ## Piper X Setup
 
+<p align="center">
+  <img src="media/piper.png" alt="Piper X scene" width="50%">
+</p>
+
 Clone the AgileX Isaac Sim repo into the Isaac root:
 
 ```powershell
