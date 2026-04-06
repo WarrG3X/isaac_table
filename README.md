@@ -8,6 +8,7 @@ Simple Isaac Sim tabletop bin-picking scene with an overhead RGB-D camera.
 
 - `simple_floor_table.backup.py`: baseline scene with table, side bin, lighting, and camera.
 - `simple_floor_table.py`: clutter drop pipeline using procedural objects, with RGB and depth capture after the objects settle in the bin.
+- `piper_x_scene.py`: single-arm Piper X scene on the table, using the cloned `piper_isaac_sim` robot USD.
 
 ## Run
 
@@ -26,6 +27,45 @@ Useful options:
 ```
 
 Captured outputs are written to `camera_debug/` after the dropped objects settle. Example captured renders are also copied into `media/`.
+
+## Piper X Setup
+
+Clone the AgileX Isaac Sim repo into the Isaac root:
+
+```powershell
+git clone https://github.com/agilexrobotics/piper_isaac_sim.git
+```
+
+This scene currently uses the following USD from that repo:
+
+```text
+C:\Users\Warra\Downloads\Isaac\piper_isaac_sim\USD\piper_x_v1.usd
+```
+
+Run the single-arm Piper scene:
+
+```powershell
+.\python.bat standalone_examples\user\isaac_table\piper_x_scene.py
+```
+
+Run the simple joint-space motion test:
+
+```powershell
+.\python.bat standalone_examples\user\isaac_table\piper_x_scene.py --test-motion
+```
+
+Useful Piper options:
+
+```powershell
+.\python.bat standalone_examples\user\isaac_table\piper_x_scene.py --robot-y 0.18
+.\python.bat standalone_examples\user\isaac_table\piper_x_scene.py --test-motion --hold-frames 120
+```
+
+Notes:
+
+- The scene uses the shipped `piper_x_v1.usd`, not a fresh URDF import.
+- This is intentional on Windows because the cloned repo has mesh filename case collisions such as `base_Link.dae` vs `base_link.dae`.
+- The current motion test uses direct joint state setting to validate articulation access. It is not yet a smooth controller.
 
 ## YCB Assets
 
