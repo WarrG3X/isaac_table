@@ -19,7 +19,7 @@ from isaacsim.core.utils.viewports import set_camera_view
 from isaacsim.sensors.camera import Camera
 from isaacsim.storage.native import get_assets_root_path
 from PIL import Image
-from pxr import Gf, Sdf, UsdGeom, UsdLux, UsdShade
+from pxr import Gf, Sdf, UsdGeom, UsdLux, UsdShade, Vt
 
 parser = argparse.ArgumentParser()
 parser.add_argument(
@@ -42,6 +42,7 @@ parser.add_argument(
     help="Save RGB and depth snapshots after objects settle in the bin.",
 )
 args, _ = parser.parse_known_args()
+REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
 
 
 def define_box(stage, prim_path, size, translate):
@@ -54,7 +55,55 @@ def define_box(stage, prim_path, size, translate):
     return cube.GetPrim()
 
 
-def create_omnipbr_material(stage, material_path, color=None, roughness=0.5, metallic=0.0, texture_path=None):
+def define_uv_plane(stage, prim_path, size, translate, uv_scale=(1.0, 1.0)):
+    root = UsdGeom.Xform.Define(stage, prim_path)
+    root.AddTranslateOp().Set(Gf.Vec3d(*translate))
+    root.AddScaleOp().Set(Gf.Vec3f(size[0], size[1], 1.0))
+
+    mesh = UsdGeom.Mesh.Define(stage, f"{prim_path}/Geom")
+    mesh.CreatePointsAttr(
+        [
+            Gf.Vec3f(-0.5, -0.5, 0.0),
+            Gf.Vec3f(0.5, -0.5, 0.0),
+            Gf.Vec3f(0.5, 0.5, 0.0),
+            Gf.Vec3f(-0.5, 0.5, 0.0),
+        ]
+    )
+    mesh.CreateFaceVertexCountsAttr([4])
+    mesh.CreateFaceVertexIndicesAttr([0, 1, 2, 3])
+    mesh.CreateNormalsAttr([Gf.Vec3f(0.0, 0.0, 1.0)] * 4)
+    mesh.SetNormalsInterpolation(UsdGeom.Tokens.vertex)
+    mesh.CreateExtentAttr([Gf.Vec3f(-0.5, -0.5, 0.0), Gf.Vec3f(0.5, 0.5, 0.0)])
+
+    primvars_api = UsdGeom.PrimvarsAPI(mesh)
+    st = primvars_api.CreatePrimvar("st", Sdf.ValueTypeNames.TexCoord2fArray, UsdGeom.Tokens.vertex)
+    st.Set(
+        Vt.Vec2fArray(
+            [
+                Gf.Vec2f(0.0, 0.0),
+                Gf.Vec2f(uv_scale[0], 0.0),
+                Gf.Vec2f(uv_scale[0], uv_scale[1]),
+                Gf.Vec2f(0.0, uv_scale[1]),
+            ]
+        )
+    )
+    return mesh.GetPrim()
+
+
+def create_omnipbr_material(
+    stage,
+    material_path,
+    color=None,
+    roughness=0.5,
+    metallic=0.0,
+    texture_path=None,
+    normal_texture_path=None,
+    orm_texture_path=None,
+    enable_orm=False,
+    diffuse_tint=None,
+    albedo_brightness=None,
+    albedo_desaturation=None,
+):
     mtl_created_list = []
     omni.kit.commands.execute(
         "CreateAndBindMdlMaterialFromLibrary",
@@ -74,11 +123,31 @@ def create_omnipbr_material(stage, material_path, color=None, roughness=0.5, met
         omni.usd.create_material_input(
             material_prim, "diffuse_color_constant", Gf.Vec3f(*color), Sdf.ValueTypeNames.Color3f
         )
+    if diffuse_tint is not None:
+        omni.usd.create_material_input(
+            material_prim, "diffuse_tint", Gf.Vec3f(*diffuse_tint), Sdf.ValueTypeNames.Color3f
+        )
     omni.usd.create_material_input(material_prim, "reflection_roughness_constant", roughness, Sdf.ValueTypeNames.Float)
     omni.usd.create_material_input(material_prim, "metallic_constant", metallic, Sdf.ValueTypeNames.Float)
+    if albedo_brightness is not None:
+        omni.usd.create_material_input(
+            material_prim, "albedo_brightness", albedo_brightness, Sdf.ValueTypeNames.Float
+        )
+    if albedo_desaturation is not None:
+        omni.usd.create_material_input(
+            material_prim, "albedo_desaturation", albedo_desaturation, Sdf.ValueTypeNames.Float
+        )
 
     if texture_path:
         omni.usd.create_material_input(material_prim, "diffuse_texture", texture_path, Sdf.ValueTypeNames.Asset)
+    if normal_texture_path:
+        omni.usd.create_material_input(
+            material_prim, "normalmap_texture", normal_texture_path, Sdf.ValueTypeNames.Asset
+        )
+    if orm_texture_path:
+        omni.usd.create_material_input(material_prim, "ORM_texture", orm_texture_path, Sdf.ValueTypeNames.Asset)
+    if enable_orm:
+        omni.usd.create_material_input(material_prim, "enable_ORM_texture", True, Sdf.ValueTypeNames.Bool)
 
     return UsdShade.Material(material_prim)
 
@@ -399,26 +468,51 @@ if assets_root:
     candidate = assets_root + "/Isaac/Samples/DR/Materials/Textures/marble_tile.png"
     if os.path.exists(candidate):
         marble_texture_path = candidate
+bamboo_texture_path = os.path.join(REPO_ROOT, "materials", "nv_bamboo_desktop.jpg")
+if not os.path.exists(bamboo_texture_path):
+    bamboo_texture_path = None
+granite_texture_path = os.path.join(REPO_ROOT, "materials", "nv_granite_tile.jpg")
+if not os.path.exists(granite_texture_path):
+    granite_texture_path = None
+aluminum_anodized_dir = os.path.join(REPO_ROOT, "materials", "Aluminum_Anodized")
+aluminum_anodized_basecolor = os.path.join(aluminum_anodized_dir, "Aluminum_Anodized_BaseColor.png")
+if not os.path.exists(aluminum_anodized_basecolor):
+    aluminum_anodized_basecolor = None
+aluminum_anodized_normal = os.path.join(aluminum_anodized_dir, "Aluminum_Anodized_Normal.png")
+if not os.path.exists(aluminum_anodized_normal):
+    aluminum_anodized_normal = None
+aluminum_anodized_orm = os.path.join(aluminum_anodized_dir, "Aluminum_Anodized_ORM.png")
+if not os.path.exists(aluminum_anodized_orm):
+    aluminum_anodized_orm = None
+aluminum_anodized_height = os.path.join(aluminum_anodized_dir, "Aluminum_Anodized_H.png")
+if not os.path.exists(aluminum_anodized_height):
+    aluminum_anodized_height = None
 
-floor_material_dark = create_omnipbr_material(
+floor_material_base = create_omnipbr_material(
     stage,
-    "/World/Looks/FloorDark",
-    color=(0.33, 0.34, 0.36),
-    roughness=0.7,
-    texture_path=marble_texture_path,
+    "/World/Looks/FloorBase",
+    color=(0.44, 0.46, 0.48),
+    roughness=0.72,
 )
-floor_material_light = create_omnipbr_material(
+floor_material = create_omnipbr_material(
     stage,
-    "/World/Looks/FloorLight",
-    color=(0.60, 0.61, 0.62),
-    roughness=0.55,
-    texture_path=marble_texture_path,
+    "/World/Looks/Floor",
+    color=(0.85, 0.85, 0.85),
+    roughness=0.62,
+    texture_path=granite_texture_path,
 )
 wood_material = create_omnipbr_material(
     stage,
     "/World/Looks/Wood",
-    color=(0.54, 0.39, 0.24),
-    roughness=0.45,
+    color=(0.72, 0.66, 0.54),
+    roughness=0.38,
+    texture_path=bamboo_texture_path,
+)
+wood_base_material = create_omnipbr_material(
+    stage,
+    "/World/Looks/WoodBase",
+    color=(0.49, 0.35, 0.20),
+    roughness=0.48,
 )
 leg_material = create_omnipbr_material(
     stage,
@@ -426,27 +520,37 @@ leg_material = create_omnipbr_material(
     color=(0.19, 0.12, 0.08),
     roughness=0.5,
 )
-bin_material = create_omniglass_material(
+bin_material = create_omnipbr_material(
     stage,
     "/World/Looks/Bin",
-    color=(0.45, 0.62, 0.88),
-    ior=1.18,
+    color=(0.50, 0.50, 0.50),
+    roughness=0.0,
+    metallic=0.0,
+    texture_path=aluminum_anodized_basecolor,
+    normal_texture_path=aluminum_anodized_normal,
+    orm_texture_path=aluminum_anodized_orm,
+    enable_orm=aluminum_anodized_orm is not None,
+    diffuse_tint=(0.32, 0.32, 0.34),
+    albedo_brightness=0.35,
 )
 
-tile_size = 0.75
-tile_thickness = 0.02
-half_span = 4
-floor_geom_paths = []
-for ix in range(-half_span, half_span + 1):
-    for iy in range(-half_span, half_span + 1):
-        tile_prim = define_box(
-            stage,
-            f"/World/Floor/{tile_name(ix, iy)}",
-            size=(tile_size, tile_size, tile_thickness),
-            translate=(ix * tile_size, iy * tile_size, -tile_thickness * 0.5),
-        )
-        bind_material(tile_prim, floor_material_dark if (ix + iy) % 2 == 0 else floor_material_light)
-        floor_geom_paths.append(str(tile_prim.GetPath()))
+floor_base_prim = define_box(
+    stage,
+    "/World/Floor/Base",
+    size=(6.8, 6.8, 0.02),
+    translate=(0.0, 0.0, -0.01),
+)
+bind_material(floor_base_prim, floor_material_base)
+
+floor_surface_prim = define_uv_plane(
+    stage,
+    "/World/Floor/Surface",
+    size=(6.72, 6.72),
+    translate=(0.0, 0.0, 0.001),
+    uv_scale=(6.0, 6.0),
+)
+bind_material(floor_surface_prim, floor_material)
+floor_geom_paths = [str(floor_base_prim.GetPath())]
 
 top_prim = define_box(
     stage,
@@ -454,7 +558,15 @@ top_prim = define_box(
     size=(1.4, 0.8, 0.06),
     translate=(0.0, 0.0, 0.75),
 )
-bind_material(top_prim, wood_material)
+bind_material(top_prim, wood_base_material)
+
+table_surface_prim = define_uv_plane(
+    stage,
+    "/World/Table/TopSurface",
+    size=(1.36, 0.76),
+    translate=(0.0, 0.0, 0.781),
+)
+bind_material(table_surface_prim, wood_material)
 
 leg_height = 0.72
 leg_size = (0.06, 0.06, leg_height)
