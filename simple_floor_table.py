@@ -12,6 +12,8 @@ import omni.usd
 from isaacsim.core.api import World
 from isaacsim.core.api.objects import DynamicCuboid, DynamicCylinder, DynamicSphere
 from isaacsim.core.prims import GeometryPrim, SingleRigidPrim
+from isaacsim.core.utils.prims import get_prim_at_path
+from isaacsim.core.utils.semantics import add_labels
 from isaacsim.core.utils.stage import add_reference_to_stage
 from isaacsim.core.utils.viewports import set_camera_view
 from isaacsim.sensors.camera import Camera
@@ -26,8 +28,8 @@ parser.add_argument(
     default="prims",
     help="Object source to populate into the bin. YCB is a placeholder until Isaac assets are available.",
 )
-parser.add_argument("--num-objects", type=int, default=6, help="Number of clutter objects to drop into the bin.")
-parser.add_argument("--seed", type=int, default=7, help="Deterministic seed for object placement.")
+parser.add_argument("--num-objects", type=int, default=10, help="Number of clutter objects to drop into the bin.")
+parser.add_argument("--seed", type=int, default=42, help="Deterministic seed for object placement.")
 parser.add_argument(
     "--asset-root",
     type=str,
@@ -151,6 +153,92 @@ def save_camera_debug(camera, output_dir):
     print(f"[TopDownCamera] saved RGB and depth to {output_dir}")
 
 
+def build_segmentation_palette(num_objects):
+    object_palette = []
+    for idx in range(num_objects):
+        hue = (37 * idx) % 255
+        object_palette.append(
+            np.array(
+                [
+                    64 + (hue % 128),
+                    96 + ((hue * 3) % 128),
+                    64 + ((hue * 5) % 128),
+                ],
+                dtype=np.uint8,
+            )
+        )
+    return {
+        "background": np.array([20, 20, 20], dtype=np.uint8),
+        "bin": np.array([60, 120, 220], dtype=np.uint8),
+        "objects": object_palette,
+    }
+
+
+def collect_segmentation_ids(current_frame_entry):
+    info = current_frame_entry.get("info", {})
+    id_to_labels = info.get("idToLabels", {})
+    parsed = {}
+    for key, value in id_to_labels.items():
+        try:
+            parsed[int(key)] = value
+        except Exception:
+            continue
+    return parsed
+
+
+def build_custom_instance_segmentation(camera, output_dir, clutter_objects, bin_prim_prefix="/World/Bin"):
+    frame = camera.get_current_frame()
+    seg_entry = frame.get("instance_segmentation")
+    if seg_entry is None:
+        print("[TopDownCamera] instance segmentation frame entry missing")
+        return
+
+    seg_data = np.asarray(seg_entry["data"], dtype=np.uint32)
+    id_to_labels = collect_segmentation_ids(seg_entry)
+    unique_ids = np.unique(seg_data)
+    print(f"[TopDownCamera] instance segmentation unique ids: {unique_ids[:20].tolist()} total={len(unique_ids)}")
+    print(f"[TopDownCamera] instance segmentation mapped labels: {list(id_to_labels.items())[:10]}")
+    palette = build_segmentation_palette(len(clutter_objects))
+
+    mask = np.zeros((seg_data.shape[0], seg_data.shape[1], 3), dtype=np.uint8)
+    mask[:, :] = palette["background"]
+
+    clutter_paths = {}
+    for idx, obj in enumerate(clutter_objects):
+        clutter_paths[get_prim_at_path(obj.prim_path).GetPrimPath().pathString] = idx
+
+    bin_ids = set()
+    object_ids = {}
+
+    for seg_id, labels in id_to_labels.items():
+        prim_path = None
+        if isinstance(labels, dict):
+            prim_path = labels.get("instancePath") or labels.get("primPath")
+        elif isinstance(labels, str):
+            prim_path = labels
+        if prim_path is None:
+            continue
+
+        if prim_path.startswith(bin_prim_prefix):
+            bin_ids.add(seg_id)
+            continue
+
+        for clutter_path, object_idx in clutter_paths.items():
+            if prim_path.startswith(clutter_path):
+                object_ids[seg_id] = object_idx
+                break
+
+    for seg_id in bin_ids:
+        mask[seg_data == seg_id] = palette["bin"]
+
+    for seg_id, object_idx in object_ids.items():
+        mask[seg_data == seg_id] = palette["objects"][object_idx]
+
+    out_path = os.path.join(output_dir, "realsense_instance_seg.png")
+    Image.fromarray(mask).save(out_path)
+    print(f"[TopDownCamera] saved instance segmentation to {out_path}")
+
+
 def resolve_asset_root(explicit_asset_root):
     if explicit_asset_root and os.path.exists(os.path.join(explicit_asset_root, "Isaac")):
         return explicit_asset_root
@@ -222,6 +310,7 @@ def spawn_primitive_objects(world, rng, count, bin_center_y, table_surface_z):
                     color=spec["color"],
                 )
             )
+        add_labels(get_prim_at_path(obj.prim_path), [f"clutter_{idx}"])
         spawned.append(obj)
 
     return spawned
@@ -263,6 +352,7 @@ def spawn_ycb_objects(world, rng, count, asset_root, bin_center_y, table_surface
                 orientation=rot_utils.euler_angles_to_quats(np.array([0.0, 0.0, yaw]), degrees=True),
             )
         )
+        add_labels(get_prim_at_path(prim_path), [f"clutter_{idx}"])
         spawned.append(rigid)
 
     return spawned
@@ -420,6 +510,7 @@ bin_geom_paths = []
 for name, (size, position) in bin_parts.items():
     bin_prim = define_box(stage, f"/World/Bin/{name}", size=size, translate=position)
     bind_material(bin_prim, bin_material)
+    add_labels(bin_prim, ["bin"])
     bin_geom_paths.append(str(bin_prim.GetPath()))
 
 dome_light = UsdLux.DomeLight.Define(stage, Sdf.Path("/World/Lights/Dome"))
@@ -465,6 +556,7 @@ topdown_camera = Camera(
 world.reset()
 topdown_camera.initialize()
 topdown_camera.attach_annotator("distance_to_image_plane")
+topdown_camera.add_instance_segmentation_to_frame()
 
 horizontal_aperture = pixel_size_um * camera_width * 1e-6
 focal_length = pixel_size_um * ((d455_fx + d455_fy) * 0.5) * 1e-6
@@ -492,7 +584,7 @@ settle_counter = 0
 settle_counter_target = 30
 capture_done = False
 frame_count = 0
-max_wait_frames = 600
+max_wait_frames = 120
 last_progress_frame = -1
 
 for _ in range(15):
@@ -518,6 +610,9 @@ while simulation_app.is_running():
 
     if settled and not capture_done:
         save_camera_debug(topdown_camera, os.path.join(os.getcwd(), "camera_debug"))
+        build_custom_instance_segmentation(
+            topdown_camera, os.path.join(os.getcwd(), "camera_debug"), clutter_objects
+        )
         capture_done = True
 
         if args.save_camera_debug:
@@ -526,6 +621,9 @@ while simulation_app.is_running():
     if not capture_done and frame_count >= max_wait_frames:
         print("[TopDownCamera] settle timeout reached, capturing current frame")
         save_camera_debug(topdown_camera, os.path.join(os.getcwd(), "camera_debug"))
+        build_custom_instance_segmentation(
+            topdown_camera, os.path.join(os.getcwd(), "camera_debug"), clutter_objects
+        )
         capture_done = True
 
 simulation_app.close()
