@@ -2,6 +2,8 @@
 
 Simple Isaac Sim tabletop bin-picking scene with an overhead RGB-D camera.
 
+![Rendered outputs](media/render_triptych.png)
+
 ## Files
 
 - `simple_floor_table.backup.py`: baseline scene with table, side bin, lighting, and camera.
@@ -23,7 +25,7 @@ Useful options:
 .\\python.bat standalone_examples\user\isaac_table\simple_floor_table.py --object-source ycb --asset-root "C:/Users/Warra/Downloads/Assets/Isaac/5.1"
 ```
 
-Captured outputs are written to `camera_debug/` after the dropped objects settle.
+Captured outputs are written to `camera_debug/` after the dropped objects settle. Example captured renders are also copied into `media/`.
 
 ## YCB Assets
 
