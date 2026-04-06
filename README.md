@@ -4,6 +4,44 @@ Simple Isaac Sim tabletop bin-picking scene with an overhead RGB-D camera.
 
 ![Rendered outputs](media/render_triptych.png)
 
+## Handoff
+
+Tested setup:
+
+- Isaac Sim `5.1.x`
+- Windows
+
+External prerequisites expected by the current scripts:
+
+- Isaac asset root:
+  - `C:\Users\Warra\Downloads\Assets\Isaac\5.1`
+- AgileX Piper repo cloned into the Isaac install root:
+  - `C:\Users\Warra\Downloads\Isaac\piper_isaac_sim`
+
+Known-good current state:
+
+- `simple_floor_table.py` builds the table/bin scene and overhead RealSense-style RGB-D camera.
+- RGB, depth, and custom instance segmentation capture are working.
+- YCB object dropping works from the local Isaac `Materials & Props` asset pack.
+- `piper_x_scene.py` loads one Piper X onto the table from the shipped AgileX USD.
+- The current Piper motion test confirms articulation access and joint actuation wiring.
+
+Known caveats:
+
+- The YCB setup is not self-contained in this repo; it depends on the local Isaac asset pack.
+- The Piper setup is not self-contained in this repo; it depends on the separately cloned `piper_isaac_sim` repo.
+- On Windows, the cloned Piper repo has mesh filename case collisions such as `base_Link.dae` vs `base_link.dae`.
+- For that reason, the current robot scene uses the shipped `piper_x_v1.usd` instead of re-importing the URDF.
+- The current Piper motion test uses direct joint state setting, so it teleports between poses instead of moving under a smooth controller.
+- Only one Piper arm is integrated so far. Dual-arm is still pending.
+
+Recommended next steps:
+
+1. Replace the Piper teleport test with articulation-controller-based joint target control.
+2. Tune one-arm base placement and reachable pre-grasp poses into the side bin.
+3. Verify end-effector frame orientation and gripper behavior.
+4. Duplicate and mirror the setup into a dual-arm table scene.
+
 ## Files
 
 - `simple_floor_table.backup.py`: baseline scene with table, side bin, lighting, and camera.
