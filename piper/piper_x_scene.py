@@ -6,17 +6,24 @@ import argparse
 import os
 import sys
 
+import isaacsim.core.utils.numpy.rotations as rot_utils
 import numpy as np
 import omni.kit.commands
 import omni.ui as ui
+import omni.usd
 from isaacsim.core.api import World
-from isaacsim.core.prims import GeometryPrim, SingleArticulation
+from isaacsim.core.api.objects import DynamicCuboid, DynamicCylinder, DynamicSphere
+from isaacsim.core.prims import GeometryPrim, SingleArticulation, SingleRigidPrim
 from isaacsim.core.utils.numpy.rotations import euler_angles_to_quats, rot_matrices_to_quats
+from isaacsim.core.utils.prims import get_prim_at_path
+from isaacsim.core.utils.semantics import add_labels
 from isaacsim.core.utils.stage import add_reference_to_stage
 from isaacsim.core.utils.types import ArticulationAction, ArticulationActions
 from isaacsim.core.utils.viewports import create_viewport_for_camera, set_camera_view
 from isaacsim.robot_motion.motion_generation import ArticulationKinematicsSolver, LulaKinematicsSolver
 from isaacsim.sensors.camera import Camera
+from isaacsim.storage.native import get_assets_root_path
+from PIL import Image
 from pxr import Gf, Sdf, UsdGeom, UsdLux, UsdShade, Vt
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -43,6 +50,12 @@ parser.add_argument("--hold-frames", type=int, default=180, help="Frames to hold
 parser.add_argument("--circle-motion", action="store_true", help="Run a smooth continuous wrist motion test.")
 parser.add_argument("--robot-camera-view", action="store_true", help="Open a second viewport from the robot-mounted camera.")
 parser.add_argument("--joint-ui", action="store_true", help="Open joint sliders for manual robot control.")
+parser.add_argument("--object-source", choices=["none", "prims", "ycb"], default="none", help="Populate the side bin with dropped clutter.")
+parser.add_argument("--num-objects", type=int, default=10, help="Number of clutter objects to drop into the bin.")
+parser.add_argument("--seed", type=int, default=42, help="Deterministic seed for clutter placement.")
+parser.add_argument("--asset-root", type=str, default="C:/Users/Warra/Downloads/Assets/Isaac/5.1", help="Local Isaac asset root containing the top-level Isaac folder.")
+parser.add_argument("--topdown-camera", action="store_true", help="Create the overhead RGB-D camera used by the clutter scene.")
+parser.add_argument("--save-camera-debug", action="store_true", help="Save RGB/depth/instance-seg snapshots from the overhead camera after clutter settles.")
 parser.add_argument("--lula-list-frames", action="store_true", help="Print Lula frame names and exit.")
 parser.add_argument("--lula-ik-test", action="store_true", help="Run a simple Lula IK solve and drive to the target.")
 parser.add_argument("--lula-yaml", type=str, default=DEFAULT_LULA_YAML, help="Path to exported Lula robot description YAML.")
@@ -160,6 +173,236 @@ def bind_material(prim, material):
 def apply_static_collision(prim_paths):
     for prim_path in prim_paths:
         GeometryPrim(prim_path).apply_collision_apis()
+
+
+def resolve_asset_root(explicit_asset_root):
+    if explicit_asset_root and os.path.exists(os.path.join(explicit_asset_root, "Isaac")):
+        return explicit_asset_root
+    try:
+        detected_asset_root = get_assets_root_path()
+        if detected_asset_root and os.path.exists(os.path.join(detected_asset_root, "Isaac")):
+            return detected_asset_root
+    except Exception:
+        pass
+    return None
+
+
+def save_camera_debug(camera, output_dir):
+    os.makedirs(output_dir, exist_ok=True)
+    rgb = np.asarray(camera.get_rgb(device="cpu"), dtype=np.uint8)
+    depth = np.asarray(camera.get_depth(device="cpu"), dtype=np.float32)
+    finite_depth = depth[np.isfinite(depth)]
+
+    if finite_depth.size:
+        print(
+            f"[TopDownCamera] depth finite pixels={finite_depth.size} "
+            f"min={finite_depth.min():.4f}m max={finite_depth.max():.4f}m mean={finite_depth.mean():.4f}m"
+        )
+    else:
+        print("[TopDownCamera] no finite depth pixels found")
+
+    Image.fromarray(rgb).save(os.path.join(output_dir, "realsense_rgb.png"))
+
+    depth_to_save = depth.copy()
+    depth_to_save[~np.isfinite(depth_to_save)] = 0.0
+    np.save(os.path.join(output_dir, "realsense_depth.npy"), depth_to_save)
+
+    if finite_depth.size:
+        near = np.percentile(finite_depth, 2)
+        far = np.percentile(finite_depth, 98)
+        if far <= near:
+            far = near + 1e-3
+        depth_normalized = np.clip((depth_to_save - near) / (far - near), 0.0, 1.0)
+        depth_normalized = (255.0 * (1.0 - depth_normalized)).astype(np.uint8)
+        Image.fromarray(depth_normalized).save(os.path.join(output_dir, "realsense_depth_vis.png"))
+
+    print(f"[TopDownCamera] saved RGB and depth to {output_dir}")
+
+
+def build_segmentation_palette(num_objects):
+    object_palette = []
+    for idx in range(num_objects):
+        hue = (37 * idx) % 255
+        object_palette.append(
+            np.array(
+                [64 + (hue % 128), 96 + ((hue * 3) % 128), 64 + ((hue * 5) % 128)],
+                dtype=np.uint8,
+            )
+        )
+    return {
+        "background": np.array([20, 20, 20], dtype=np.uint8),
+        "bin": np.array([60, 120, 220], dtype=np.uint8),
+        "objects": object_palette,
+    }
+
+
+def collect_segmentation_ids(current_frame_entry):
+    info = current_frame_entry.get("info", {})
+    id_to_labels = info.get("idToLabels", {})
+    parsed = {}
+    for key, value in id_to_labels.items():
+        try:
+            parsed[int(key)] = value
+        except Exception:
+            continue
+    return parsed
+
+
+def build_custom_instance_segmentation(camera, output_dir, clutter_objects, bin_prim_prefix="/World/Bin"):
+    frame = camera.get_current_frame()
+    seg_entry = frame.get("instance_segmentation")
+    if seg_entry is None:
+        print("[TopDownCamera] instance segmentation frame entry missing")
+        return
+
+    seg_data = np.asarray(seg_entry["data"], dtype=np.uint32)
+    id_to_labels = collect_segmentation_ids(seg_entry)
+    palette = build_segmentation_palette(len(clutter_objects))
+    mask = np.zeros((seg_data.shape[0], seg_data.shape[1], 3), dtype=np.uint8)
+    mask[:, :] = palette["background"]
+
+    clutter_paths = {get_prim_at_path(obj.prim_path).GetPrimPath().pathString: idx for idx, obj in enumerate(clutter_objects)}
+    bin_ids = set()
+    object_ids = {}
+
+    for seg_id, labels in id_to_labels.items():
+        prim_path = None
+        if isinstance(labels, dict):
+            prim_path = labels.get("instancePath") or labels.get("primPath")
+        elif isinstance(labels, str):
+            prim_path = labels
+        if prim_path is None:
+            continue
+        if prim_path.startswith(bin_prim_prefix):
+            bin_ids.add(seg_id)
+            continue
+        for clutter_path, object_idx in clutter_paths.items():
+            if prim_path.startswith(clutter_path):
+                object_ids[seg_id] = object_idx
+                break
+
+    for seg_id in bin_ids:
+        mask[seg_data == seg_id] = palette["bin"]
+    for seg_id, object_idx in object_ids.items():
+        mask[seg_data == seg_id] = palette["objects"][object_idx]
+
+    out_path = os.path.join(output_dir, "realsense_instance_seg.png")
+    Image.fromarray(mask).save(out_path)
+    print(f"[TopDownCamera] saved instance segmentation to {out_path}")
+
+
+def spawn_primitive_objects(world, rng, count, bin_center_y, table_surface_z):
+    object_specs = [
+        {"kind": "cuboid", "size": 1.0, "scale": np.array([0.055, 0.08, 0.035]), "mass": 0.07, "color": np.array([214, 86, 73])},
+        {"kind": "cuboid", "size": 1.0, "scale": np.array([0.05, 0.05, 0.12]), "mass": 0.09, "color": np.array([78, 121, 167])},
+        {"kind": "sphere", "radius": 0.03, "mass": 0.05, "color": np.array([89, 161, 79])},
+        {"kind": "sphere", "radius": 0.026, "mass": 0.04, "color": np.array([242, 142, 43])},
+        {"kind": "cylinder", "radius": 0.028, "height": 0.09, "mass": 0.08, "color": np.array([176, 122, 161])},
+        {"kind": "cylinder", "radius": 0.022, "height": 0.12, "mass": 0.06, "color": np.array([118, 183, 178])},
+    ]
+    spawned = []
+    drop_height = table_surface_z + 0.22
+    for idx in range(count):
+        spec = object_specs[idx % len(object_specs)]
+        x = float(rng.uniform(-0.18, 0.18))
+        y = float(bin_center_y + rng.uniform(-0.09, 0.09))
+        z = float(drop_height + 0.035 * idx)
+        yaw = float(rng.uniform(0.0, 360.0))
+        if spec["kind"] == "cuboid":
+            obj = world.scene.add(
+                DynamicCuboid(
+                    prim_path=f"/World/Clutter/Object_{idx}",
+                    name=f"clutter_box_{idx}",
+                    position=np.array([x, y, z]),
+                    orientation=rot_utils.euler_angles_to_quats(np.array([0.0, 0.0, yaw]), degrees=True),
+                    scale=spec["scale"],
+                    size=spec["size"],
+                    mass=spec["mass"],
+                    color=spec["color"],
+                )
+            )
+        elif spec["kind"] == "sphere":
+            obj = world.scene.add(
+                DynamicSphere(
+                    prim_path=f"/World/Clutter/Object_{idx}",
+                    name=f"clutter_sphere_{idx}",
+                    position=np.array([x, y, z]),
+                    radius=spec["radius"],
+                    mass=spec["mass"],
+                    color=spec["color"],
+                )
+            )
+        else:
+            obj = world.scene.add(
+                DynamicCylinder(
+                    prim_path=f"/World/Clutter/Object_{idx}",
+                    name=f"clutter_cylinder_{idx}",
+                    position=np.array([x, y, z]),
+                    orientation=rot_utils.euler_angles_to_quats(np.array([90.0, 0.0, yaw]), degrees=True),
+                    radius=spec["radius"],
+                    height=spec["height"],
+                    mass=spec["mass"],
+                    color=spec["color"],
+                )
+            )
+        add_labels(get_prim_at_path(obj.prim_path), [f"clutter_{idx}"])
+        spawned.append(obj)
+    return spawned
+
+
+def list_ycb_assets(asset_root):
+    ycb_dir = os.path.join(asset_root, "Isaac", "Props", "YCB", "Axis_Aligned_Physics")
+    if not os.path.exists(ycb_dir):
+        raise RuntimeError(f"YCB asset directory not found: {ycb_dir}")
+    entries = sorted([os.path.join(ycb_dir, name) for name in os.listdir(ycb_dir) if name.endswith(".usd") and not name.startswith(".")])
+    if not entries:
+        raise RuntimeError(f"No YCB USD files found in: {ycb_dir}")
+    return entries
+
+
+def spawn_ycb_objects(world, rng, count, asset_root, bin_center_y, table_surface_z):
+    ycb_assets = list_ycb_assets(asset_root)
+    spawned = []
+    drop_height = table_surface_z + 0.24
+    for idx in range(count):
+        usd_path = ycb_assets[idx % len(ycb_assets)]
+        prim_path = f"/World/Clutter/Object_{idx}"
+        add_reference_to_stage(usd_path=usd_path, prim_path=prim_path)
+        x = float(rng.uniform(-0.16, 0.16))
+        y = float(bin_center_y + rng.uniform(-0.08, 0.08))
+        z = float(drop_height + 0.05 * idx)
+        yaw = float(rng.uniform(0.0, 360.0))
+        rigid = world.scene.add(
+            SingleRigidPrim(
+                prim_path=prim_path,
+                name=f"ycb_object_{idx}",
+                position=np.array([x, y, z]),
+                orientation=rot_utils.euler_angles_to_quats(np.array([0.0, 0.0, yaw]), degrees=True),
+            )
+        )
+        add_labels(get_prim_at_path(prim_path), [f"clutter_{idx}"])
+        spawned.append(rigid)
+    return spawned
+
+
+def spawn_objects(world, stage, rng, source, count, asset_root, bin_center_y, table_surface_z):
+    UsdGeom.Xform.Define(stage, "/World/Clutter")
+    if source == "prims":
+        return spawn_primitive_objects(world, rng, count, bin_center_y, table_surface_z)
+    if source == "ycb":
+        if asset_root is None:
+            raise RuntimeError("No Isaac asset root is available for YCB spawning.")
+        return spawn_ycb_objects(world, rng, count, asset_root, bin_center_y, table_surface_z)
+    return []
+
+
+def objects_are_settled(objects, linear_threshold=0.03, angular_threshold=0.6):
+    for obj in objects:
+        linear = np.linalg.norm(np.asarray(obj.get_linear_velocity()))
+        angular = np.linalg.norm(np.asarray(obj.get_angular_velocity()))
+        if linear > linear_threshold or angular > angular_threshold:
+            return False
+    return True
 
 
 def deactivate_embedded_environment(stage, root_prim_path):
@@ -323,10 +566,13 @@ lula_yaml = resolve_required_file(args.lula_yaml, "Lula robot description YAML")
 lula_urdf = resolve_required_file(args.lula_urdf, "Lula URDF") if lula_enabled else None
 
 world = World(stage_units_in_meters=1.0)
-world.scene.add_default_ground_plane()
 stage = world.stage
+rng = np.random.default_rng(args.seed)
+assets_root = resolve_asset_root(args.asset_root)
 UsdGeom.SetStageUpAxis(stage, UsdGeom.Tokens.z)
 UsdGeom.Xform.Define(stage, "/World")
+UsdGeom.Xform.Define(stage, "/World/Looks")
+UsdGeom.Xform.Define(stage, "/World/Floor")
 UsdGeom.Xform.Define(stage, "/World/Table")
 UsdGeom.Xform.Define(stage, "/World/Bin")
 UsdGeom.Xform.Define(stage, "/World/Lights")
@@ -380,6 +626,7 @@ floor_surface_prim = define_uv_plane(
     uv_scale=(6.0, 6.0),
 )
 bind_material(floor_surface_prim, floor_material)
+floor_geom_paths = [str(floor_base_prim.GetPath())]
 
 table_top_z = 0.75
 table_top_thickness = 0.06
@@ -442,6 +689,7 @@ bin_geom_paths = []
 for name, (size, position) in bin_parts.items():
     bin_prim = define_box(stage, f"/World/Bin/{name}", size=size, translate=position)
     bind_material(bin_prim, bin_material)
+    add_labels(bin_prim, ["bin"])
     bin_geom_paths.append(str(bin_prim.GetPath()))
 
 dome_light = UsdLux.DomeLight.Define(stage, Sdf.Path("/World/Lights/Dome"))
@@ -462,7 +710,7 @@ table_fill.CreateColorAttr(Gf.Vec3f(1.0, 0.98, 0.95))
 UsdGeom.Xformable(table_fill.GetPrim()).AddTranslateOp().Set(Gf.Vec3f(0.0, 0.05, 1.9))
 UsdGeom.Xformable(table_fill.GetPrim()).AddRotateXYZOp().Set(Gf.Vec3f(-90.0, 0.0, 0.0))
 
-apply_static_collision([str(floor_base_prim.GetPath()), str(top_prim.GetPath()), *table_leg_paths, *bin_geom_paths])
+apply_static_collision(floor_geom_paths + [str(top_prim.GetPath())] + table_leg_paths + bin_geom_paths)
 
 mount_prim = UsdGeom.Xform.Define(stage, "/World/RobotMount/PiperX")
 mount_xform = UsdGeom.Xformable(mount_prim.GetPrim())
@@ -492,6 +740,15 @@ if args.robot_camera_view:
     )
     print(f"[PiperX] robot camera viewport: {robot_viewport.title}")
 
+topdown_camera = None
+clutter_objects = []
+settled = False
+settle_counter = 0
+settle_counter_target = 30
+capture_done = False
+frame_count = 0
+max_wait_frames = 120
+
 world.reset()
 robot.initialize()
 robot_sensor_camera = Camera(
@@ -502,6 +759,50 @@ robot_sensor_camera = Camera(
 robot_sensor_camera.initialize()
 print(f"[PiperX] robot sensor camera: {robot_sensor_camera.prim_path}")
 print("[PiperX] robot sensor camera mode: 640x480 @ 30 Hz")
+
+if args.object_source != "none":
+    clutter_objects = spawn_objects(world, stage, rng, args.object_source, args.num_objects, assets_root, bin_center_y, table_surface_z)
+    print(f"[Scene] spawned {len(clutter_objects)} {args.object_source} clutter objects")
+
+if args.topdown_camera or args.save_camera_debug:
+    camera_width = 1280
+    camera_height = 720
+    d455_fx = 640.0
+    d455_fy = 640.0
+    d455_cx = camera_width * 0.5
+    d455_cy = camera_height * 0.5
+    pixel_size_um = 3.0
+
+    topdown_camera = Camera(
+        prim_path="/World/TopDownRealsense",
+        position=np.array([0.0, bin_center_y, 1.65]),
+        frequency=30,
+        resolution=(camera_width, camera_height),
+        orientation=rot_utils.euler_angles_to_quats(np.array([0.0, 90.0, 90.0]), degrees=True),
+    )
+    topdown_camera.initialize()
+    topdown_camera.attach_annotator("distance_to_image_plane")
+    topdown_camera.add_instance_segmentation_to_frame()
+
+    horizontal_aperture = pixel_size_um * camera_width * 1e-6
+    focal_length = pixel_size_um * ((d455_fx + d455_fy) * 0.5) * 1e-6
+    topdown_camera.set_focal_length(focal_length)
+    topdown_camera.set_focus_distance(1.65)
+    topdown_camera.set_lens_aperture(0.0)
+    topdown_camera.set_horizontal_aperture(horizontal_aperture)
+    topdown_camera.set_vertical_aperture(horizontal_aperture / (camera_width / camera_height))
+    topdown_camera.set_clipping_range(0.05, 4.0)
+    topdown_camera.set_opencv_pinhole_properties(
+        cx=d455_cx,
+        cy=d455_cy,
+        fx=d455_fx,
+        fy=d455_fy,
+        pinhole=[0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+    )
+    print("[TopDownCamera] initialized")
+
+for _ in range(15):
+    world.step(render=True)
 
 joint_names = list(robot.dof_names)
 print(f"[PiperX] USD: {robot_usd}")
@@ -608,6 +909,28 @@ elif args.lula_ik_test:
 while simulation_app.is_running():
     if robot_viewport is not None:
         robot_viewport.viewport_api.camera_path = str(robot_camera_prim.GetPath())
+
+    if clutter_objects and topdown_camera is not None and args.save_camera_debug and not capture_done:
+        frame_count += 1
+        if objects_are_settled(clutter_objects):
+            settle_counter += 1
+        else:
+            settle_counter = 0
+        settled = settle_counter >= settle_counter_target
+
+        if frame_count % 60 == 0:
+            print(
+                f"[TopDownCamera] waiting for clutter to settle "
+                f"(frame={frame_count}, stable_frames={settle_counter}/{settle_counter_target})"
+            )
+
+        if settled or frame_count >= max_wait_frames:
+            if not settled:
+                print("[TopDownCamera] settle timeout reached, capturing current frame")
+            output_dir = os.path.join(ISAAC_ROOT, "camera_debug")
+            save_camera_debug(topdown_camera, output_dir)
+            build_custom_instance_segmentation(topdown_camera, output_dir, clutter_objects)
+            capture_done = True
 
     if args.ik_ui and art_kinematics is not None:
         target_position = np.array(

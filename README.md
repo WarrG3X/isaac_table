@@ -4,6 +4,8 @@ Simple Isaac Sim tabletop bin-picking scene with an overhead RGB-D camera.
 
 ![Rendered outputs](media/render_triptych.png)
 
+![Full scene example](media/full_scene_example.PNG)
+
 ## Handoff
 
 Tested setup:
@@ -91,6 +93,12 @@ Run the single-arm Piper scene:
 
 ```powershell
 .\python.bat standalone_examples\user\isaac_table\piper\piper_x_scene.py
+```
+
+Run the unified Piper scene with clutter and the top-down camera:
+
+```powershell
+.\python.bat standalone_examples\user\isaac_table\piper\piper_x_scene.py --object-source ycb --robot-camera-view --joint-ui --topdown-camera
 ```
 
 Run the simple joint-space motion test:
