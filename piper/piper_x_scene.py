@@ -14,7 +14,7 @@ from isaacsim.core.prims import GeometryPrim, SingleArticulation
 from isaacsim.core.utils.numpy.rotations import euler_angles_to_quats, rot_matrices_to_quats
 from isaacsim.core.utils.stage import add_reference_to_stage
 from isaacsim.core.utils.types import ArticulationActions
-from isaacsim.core.utils.viewports import set_camera_view
+from isaacsim.core.utils.viewports import create_viewport_for_camera, set_camera_view
 from isaacsim.robot_motion.motion_generation import ArticulationKinematicsSolver, LulaKinematicsSolver
 from pxr import Gf, Sdf, UsdGeom, UsdLux, UsdShade, Vt
 
@@ -40,6 +40,7 @@ parser.add_argument("--robot-yaw", type=float, default=90.0, help="Robot base ya
 parser.add_argument("--test-motion", action="store_true", help="Run a simple joint-space motion sequence after reset.")
 parser.add_argument("--hold-frames", type=int, default=180, help="Frames to hold each test pose.")
 parser.add_argument("--circle-motion", action="store_true", help="Run a smooth continuous wrist motion test.")
+parser.add_argument("--robot-camera-view", action="store_true", help="Open a second viewport from the robot-mounted camera.")
 parser.add_argument("--lula-list-frames", action="store_true", help="Print Lula frame names and exit.")
 parser.add_argument("--lula-ik-test", action="store_true", help="Run a simple Lula IK solve and drive to the target.")
 parser.add_argument("--lula-yaml", type=str, default=DEFAULT_LULA_YAML, help="Path to exported Lula robot description YAML.")
@@ -230,6 +231,22 @@ def create_target_marker(stage, prim_path, radius=0.018):
     xform = UsdGeom.Xformable(sphere.GetPrim())
     xform.AddTranslateOp().Set(Gf.Vec3d(0.0, 0.0, 0.0))
     return sphere.GetPrim()
+
+
+def create_robot_camera(stage, prim_path):
+    mount = UsdGeom.Xform.Define(stage, prim_path)
+    mount_xform = UsdGeom.Xformable(mount.GetPrim())
+    mount_xform.AddTranslateOp().Set(Gf.Vec3d(0.03, 0.0, 0.0))
+    mount_xform.AddRotateXYZOp().Set(Gf.Vec3f(-90.0, 0.0, 90.0))
+
+    camera = UsdGeom.Camera.Define(stage, f"{prim_path}/Sensor")
+    camera_xform = UsdGeom.Xformable(camera.GetPrim())
+    camera_xform.AddRotateXYZOp().Set(Gf.Vec3f(0.0, 0.0, 180.0))
+    camera.CreateFocalLengthAttr(1.93)
+    camera.CreateHorizontalApertureAttr(3.84)
+    camera.CreateVerticalApertureAttr(2.88)
+    camera.CreateClippingRangeAttr(Gf.Vec2f(0.02, 8.0))
+    return camera.GetPrim()
 
 
 def set_translate(prim, translate):
@@ -434,12 +451,23 @@ mount_xform.AddRotateXYZOp().Set(Gf.Vec3f(0.0, 0.0, args.robot_yaw))
 add_reference_to_stage(usd_path=robot_usd, prim_path="/World/RobotMount/PiperX/Robot")
 deactivate_embedded_environment(stage, "/World/RobotMount/PiperX/Robot")
 robot = SingleArticulation(prim_path="/World/RobotMount/PiperX/Robot", name="piper_x")
+robot_camera_prim = create_robot_camera(stage, "/World/RobotMount/PiperX/Robot/piper_x_camera/camera_link/DebugCamera")
 
 set_camera_view(
     eye=[1.7, -1.6, 1.45],
     target=[0.0, 0.15, 0.88],
     camera_prim_path="/OmniverseKit_Persp",
 )
+if args.robot_camera_view:
+    robot_viewport = create_viewport_for_camera(
+        viewport_name="Piper D435 View",
+        camera_prim_path=str(robot_camera_prim.GetPath()),
+        width=640,
+        height=480,
+        position_x=980,
+        position_y=60,
+    )
+    print(f"[PiperX] robot camera viewport: {robot_viewport.title}")
 
 world.reset()
 robot.initialize()
@@ -468,6 +496,7 @@ ik_ui_status = None
 ik_target_base_position = None
 ik_target_base_orientation = None
 ik_target_marker = None
+robot_viewport = None
 
 if lula_yaml is not None:
     lula_solver = LulaKinematicsSolver(robot_description_path=lula_yaml, urdf_path=lula_urdf)
@@ -526,6 +555,9 @@ elif args.lula_ik_test:
     print("[Lula] IK motion enabled")
 
 while simulation_app.is_running():
+    if robot_viewport is not None:
+        robot_viewport.viewport_api.camera_path = str(robot_camera_prim.GetPath())
+
     if args.ik_ui and art_kinematics is not None:
         target_position = np.array(
             [
