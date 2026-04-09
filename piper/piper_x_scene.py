@@ -13,9 +13,10 @@ from isaacsim.core.api import World
 from isaacsim.core.prims import GeometryPrim, SingleArticulation
 from isaacsim.core.utils.numpy.rotations import euler_angles_to_quats, rot_matrices_to_quats
 from isaacsim.core.utils.stage import add_reference_to_stage
-from isaacsim.core.utils.types import ArticulationActions
+from isaacsim.core.utils.types import ArticulationAction, ArticulationActions
 from isaacsim.core.utils.viewports import create_viewport_for_camera, set_camera_view
 from isaacsim.robot_motion.motion_generation import ArticulationKinematicsSolver, LulaKinematicsSolver
+from isaacsim.sensors.camera import Camera
 from pxr import Gf, Sdf, UsdGeom, UsdLux, UsdShade, Vt
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -41,6 +42,7 @@ parser.add_argument("--test-motion", action="store_true", help="Run a simple joi
 parser.add_argument("--hold-frames", type=int, default=180, help="Frames to hold each test pose.")
 parser.add_argument("--circle-motion", action="store_true", help="Run a smooth continuous wrist motion test.")
 parser.add_argument("--robot-camera-view", action="store_true", help="Open a second viewport from the robot-mounted camera.")
+parser.add_argument("--joint-ui", action="store_true", help="Open joint sliders for manual robot control.")
 parser.add_argument("--lula-list-frames", action="store_true", help="Print Lula frame names and exit.")
 parser.add_argument("--lula-ik-test", action="store_true", help="Run a simple Lula IK solve and drive to the target.")
 parser.add_argument("--lula-yaml", type=str, default=DEFAULT_LULA_YAML, help="Path to exported Lula robot description YAML.")
@@ -242,7 +244,7 @@ def create_robot_camera(stage, prim_path):
     camera = UsdGeom.Camera.Define(stage, f"{prim_path}/Sensor")
     camera_xform = UsdGeom.Xformable(camera.GetPrim())
     camera_xform.AddRotateXYZOp().Set(Gf.Vec3f(0.0, 0.0, 180.0))
-    camera.CreateFocalLengthAttr(1.93)
+    camera.CreateFocalLengthAttr(2.79)
     camera.CreateHorizontalApertureAttr(3.84)
     camera.CreateVerticalApertureAttr(2.88)
     camera.CreateClippingRangeAttr(Gf.Vec2f(0.02, 8.0))
@@ -294,6 +296,25 @@ def build_ik_window(initial_position):
                 ui.Label("Status", width=50)
                 ui.StringField(model=status_model, read_only=True)
     return window, models, status_model
+
+
+def build_joint_window(joint_names, lower_limits, upper_limits, initial_positions):
+    joint_models = {}
+    window = ui.Window("Piper Joint Control", width=460, height=360, visible=True)
+    window.position_x = 40
+    window.position_y = 360
+    with window.frame:
+        with ui.ScrollingFrame(horizontal_scrollbar_policy=ui.ScrollBarPolicy.SCROLLBAR_AS_NEEDED):
+            with ui.VStack(spacing=8, height=0):
+                ui.Label("Manual Joint Targets")
+                for idx, joint_name in enumerate(joint_names):
+                    model = ui.SimpleFloatModel(float(initial_positions[idx]))
+                    joint_models[joint_name] = model
+                    with ui.HStack(height=24):
+                        ui.Label(joint_name, width=70)
+                        ui.FloatDrag(model=model, min=float(lower_limits[idx]), max=float(upper_limits[idx]), width=80)
+                        ui.FloatSlider(model=model, min=float(lower_limits[idx]), max=float(upper_limits[idx]))
+    return window, joint_models
 
 
 robot_usd = resolve_robot_usd(args.robot_usd)
@@ -452,6 +473,8 @@ add_reference_to_stage(usd_path=robot_usd, prim_path="/World/RobotMount/PiperX/R
 deactivate_embedded_environment(stage, "/World/RobotMount/PiperX/Robot")
 robot = SingleArticulation(prim_path="/World/RobotMount/PiperX/Robot", name="piper_x")
 robot_camera_prim = create_robot_camera(stage, "/World/RobotMount/PiperX/Robot/piper_x_camera/camera_link/DebugCamera")
+robot_viewport = None
+robot_sensor_camera = None
 
 set_camera_view(
     eye=[1.7, -1.6, 1.45],
@@ -471,6 +494,14 @@ if args.robot_camera_view:
 
 world.reset()
 robot.initialize()
+robot_sensor_camera = Camera(
+    prim_path=str(robot_camera_prim.GetPath()),
+    frequency=30,
+    resolution=(640, 480),
+)
+robot_sensor_camera.initialize()
+print(f"[PiperX] robot sensor camera: {robot_sensor_camera.prim_path}")
+print("[PiperX] robot sensor camera mode: 640x480 @ 30 Hz")
 
 joint_names = list(robot.dof_names)
 print(f"[PiperX] USD: {robot_usd}")
@@ -481,6 +512,25 @@ print(f"[PiperX] initial joint positions: {robot.get_joint_positions()}")
 print(f"[PiperX] apply_action available: {hasattr(robot, 'apply_action')}")
 articulation_controller = robot.get_articulation_controller()
 print(f"[PiperX] articulation controller: {type(articulation_controller).__name__}")
+
+dof_props = robot.dof_properties
+for gripper_joint in ("joint7", "joint8"):
+    idx = joint_names.index(gripper_joint)
+    print(
+        f"[PiperX] {gripper_joint} props: "
+        f"lower={dof_props['lower'][idx]:.5f} upper={dof_props['upper'][idx]:.5f} "
+        f"stiffness={dof_props['stiffness'][idx]:.3f} damping={dof_props['damping'][idx]:.3f} "
+        f"maxEffort={dof_props['maxEffort'][idx]:.3f} maxVelocity={dof_props['maxVelocity'][idx]:.3f}"
+    )
+
+if args.joint_ui:
+    joint_ui_window, joint_ui_models = build_joint_window(
+        joint_names,
+        dof_props["lower"],
+        dof_props["upper"],
+        robot.get_joint_positions(),
+    )
+    print("[PiperX] joint slider UI enabled")
 
 motion_sequence = []
 current_pose_index = -1
@@ -496,7 +546,8 @@ ik_ui_status = None
 ik_target_base_position = None
 ik_target_base_orientation = None
 ik_target_marker = None
-robot_viewport = None
+joint_ui_window = locals().get("joint_ui_window", None)
+joint_ui_models = locals().get("joint_ui_models", None)
 
 if lula_yaml is not None:
     lula_solver = LulaKinematicsSolver(robot_description_path=lula_yaml, urdf_path=lula_urdf)
@@ -622,6 +673,9 @@ while simulation_app.is_running():
             if current_target is not None:
                 robot.apply_action(ArticulationActions(joint_positions=current_target))
             pose_hold_counter -= 1
+    elif joint_ui_models is not None:
+        joint_target = np.array([joint_ui_models[name].get_value_as_float() for name in joint_names], dtype=np.float32)
+        articulation_controller.apply_action(ArticulationAction(joint_positions=joint_target))
     world.step(render=True)
 
 simulation_app.close()
