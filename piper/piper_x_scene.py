@@ -8,15 +8,24 @@ import sys
 
 import numpy as np
 import omni.kit.commands
+import omni.ui as ui
 from isaacsim.core.api import World
-from isaacsim.core.prims import Articulation, GeometryPrim
+from isaacsim.core.prims import GeometryPrim, SingleArticulation
+from isaacsim.core.utils.numpy.rotations import euler_angles_to_quats, rot_matrices_to_quats
 from isaacsim.core.utils.stage import add_reference_to_stage
+from isaacsim.core.utils.types import ArticulationActions
 from isaacsim.core.utils.viewports import set_camera_view
+from isaacsim.robot_motion.motion_generation import ArticulationKinematicsSolver, LulaKinematicsSolver
 from pxr import Gf, Sdf, UsdGeom, UsdLux, UsdShade, Vt
 
-REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+REPO_ROOT = os.path.abspath(os.path.join(SCRIPT_DIR, ".."))
 ISAAC_ROOT = os.path.abspath(os.path.join(REPO_ROOT, "..", "..", ".."))
 DEFAULT_PIPER_USD = os.path.join(ISAAC_ROOT, "piper_isaac_sim", "USD", "piper_x_v1.usd")
+DEFAULT_LULA_YAML = os.path.join(REPO_ROOT, "desc", "piper_x_robot_description.yaml")
+DEFAULT_LULA_URDF = os.path.join(
+    ISAAC_ROOT, "piper_isaac_sim", "piper_x_description", "urdf", "piper_x_description_d435.urdf"
+)
 
 parser = argparse.ArgumentParser()
 parser.add_argument(
@@ -30,6 +39,21 @@ parser.add_argument("--robot-y", type=float, default=0.12, help="Robot base Y po
 parser.add_argument("--robot-yaw", type=float, default=90.0, help="Robot base yaw in degrees.")
 parser.add_argument("--test-motion", action="store_true", help="Run a simple joint-space motion sequence after reset.")
 parser.add_argument("--hold-frames", type=int, default=180, help="Frames to hold each test pose.")
+parser.add_argument("--circle-motion", action="store_true", help="Run a smooth continuous wrist motion test.")
+parser.add_argument("--lula-list-frames", action="store_true", help="Print Lula frame names and exit.")
+parser.add_argument("--lula-ik-test", action="store_true", help="Run a simple Lula IK solve and drive to the target.")
+parser.add_argument("--lula-yaml", type=str, default=DEFAULT_LULA_YAML, help="Path to exported Lula robot description YAML.")
+parser.add_argument("--lula-urdf", type=str, default=DEFAULT_LULA_URDF, help="Path to URDF used by Lula.")
+parser.add_argument("--ee-frame", type=str, default="Link6", help="End effector frame name for Lula IK.")
+parser.add_argument("--ik-target-dx", type=float, default=0.0, help="Target X offset from current EE pose for Lula IK.")
+parser.add_argument("--ik-target-dy", type=float, default=0.08, help="Target Y offset from current EE pose for Lula IK.")
+parser.add_argument("--ik-target-dz", type=float, default=-0.04, help="Target Z offset from current EE pose for Lula IK.")
+parser.add_argument(
+    "--ik-position-only",
+    action="store_true",
+    help="Ignore EE orientation in the Lula IK test and solve only for position.",
+)
+parser.add_argument("--ik-ui", action="store_true", help="Open a simple Lula IK slider panel for interactive testing.")
 args, _ = parser.parse_known_args()
 
 
@@ -169,6 +193,13 @@ def resolve_robot_usd(robot_usd):
     raise FileNotFoundError(f"Piper X USD not found: {candidate}")
 
 
+def resolve_required_file(path, label):
+    candidate = os.path.abspath(path)
+    if os.path.exists(candidate):
+        return candidate
+    raise FileNotFoundError(f"{label} not found: {candidate}")
+
+
 def get_test_poses(num_dof):
     home = np.zeros((1, num_dof), dtype=np.float32)
     approach = np.array([[0.0, 0.55, -0.75, 0.0, 0.42, 0.0, 0.01, -0.01]], dtype=np.float32)
@@ -181,7 +212,77 @@ def get_test_poses(num_dof):
     ]
 
 
+def get_circle_motion_target(frame_idx, num_dof):
+    target = np.zeros(num_dof, dtype=np.float32)
+    t = frame_idx / 60.0
+    target[1] = 0.62 + 0.18 * np.sin(t)
+    target[2] = -0.95 + 0.22 * np.cos(t)
+    target[4] = 0.72 + 0.16 * np.sin(t + np.pi / 2.0)
+    target[5] = 0.10 * np.sin(t)
+    target[6] = 0.015
+    target[7] = -0.015
+    return target
+
+
+def create_target_marker(stage, prim_path, radius=0.018):
+    sphere = UsdGeom.Sphere.Define(stage, prim_path)
+    sphere.CreateRadiusAttr(radius)
+    xform = UsdGeom.Xformable(sphere.GetPrim())
+    xform.AddTranslateOp().Set(Gf.Vec3d(0.0, 0.0, 0.0))
+    return sphere.GetPrim()
+
+
+def set_translate(prim, translate):
+    tx, ty, tz = float(translate[0]), float(translate[1]), float(translate[2])
+    xformable = UsdGeom.Xformable(prim)
+    translate_ops = [op for op in xformable.GetOrderedXformOps() if op.GetOpType() == UsdGeom.XformOp.TypeTranslate]
+    if translate_ops:
+        translate_ops[0].Set(Gf.Vec3d(tx, ty, tz))
+    else:
+        xformable.AddTranslateOp().Set(Gf.Vec3d(tx, ty, tz))
+
+
+def build_ik_window(initial_position):
+    models = {
+        "x": ui.SimpleFloatModel(float(initial_position[0])),
+        "y": ui.SimpleFloatModel(float(initial_position[1])),
+        "z": ui.SimpleFloatModel(float(initial_position[2])),
+        "roll": ui.SimpleFloatModel(0.0),
+        "pitch": ui.SimpleFloatModel(0.0),
+        "yaw": ui.SimpleFloatModel(0.0),
+    }
+    status_model = ui.SimpleStringModel("idle")
+    window = ui.Window("Piper Lula IK", width=380, height=240, visible=True)
+    window.position_x = 40
+    window.position_y = 80
+    with window.frame:
+        with ui.VStack(spacing=8, height=0):
+            ui.Label("World-Space IK Target")
+            for key, label, min_v, max_v in (
+                ("x", "x", -0.80, 0.80),
+                ("y", "y", -0.20, 0.80),
+                ("z", "z", 0.05, 1.20),
+            ):
+                with ui.HStack(height=24):
+                    ui.Label(label, width=32)
+                    ui.FloatDrag(model=models[key], min=min_v, max=max_v, width=70)
+                    ui.FloatSlider(model=models[key], min=min_v, max=max_v)
+            ui.Label("Orientation Offset (deg)")
+            for key, label in (("roll", "R"), ("pitch", "P"), ("yaw", "Y")):
+                with ui.HStack(height=24):
+                    ui.Label(label, width=32)
+                    ui.FloatDrag(model=models[key], min=-180.0, max=180.0, width=70)
+                    ui.FloatSlider(model=models[key], min=-180.0, max=180.0)
+            with ui.HStack(height=24):
+                ui.Label("Status", width=50)
+                ui.StringField(model=status_model, read_only=True)
+    return window, models, status_model
+
+
 robot_usd = resolve_robot_usd(args.robot_usd)
+lula_enabled = args.lula_list_frames or args.lula_ik_test or args.ik_ui
+lula_yaml = resolve_required_file(args.lula_yaml, "Lula robot description YAML") if lula_enabled else None
+lula_urdf = resolve_required_file(args.lula_urdf, "Lula URDF") if lula_enabled else None
 
 world = World(stage_units_in_meters=1.0)
 world.scene.add_default_ground_plane()
@@ -332,7 +433,7 @@ mount_xform.AddRotateXYZOp().Set(Gf.Vec3f(0.0, 0.0, args.robot_yaw))
 
 add_reference_to_stage(usd_path=robot_usd, prim_path="/World/RobotMount/PiperX/Robot")
 deactivate_embedded_environment(stage, "/World/RobotMount/PiperX/Robot")
-robot = Articulation(prim_paths_expr="/World/RobotMount/PiperX/Robot", name="piper_x")
+robot = SingleArticulation(prim_path="/World/RobotMount/PiperX/Robot", name="piper_x")
 
 set_camera_view(
     eye=[1.7, -1.6, 1.45],
@@ -341,6 +442,7 @@ set_camera_view(
 )
 
 world.reset()
+robot.initialize()
 
 joint_names = list(robot.dof_names)
 print(f"[PiperX] USD: {robot_usd}")
@@ -348,22 +450,136 @@ print(f"[PiperX] articulation prim: /World/RobotMount/PiperX/Robot")
 print(f"[PiperX] dof count: {robot.num_dof}")
 print(f"[PiperX] joints: {joint_names}")
 print(f"[PiperX] initial joint positions: {robot.get_joint_positions()}")
+print(f"[PiperX] apply_action available: {hasattr(robot, 'apply_action')}")
+articulation_controller = robot.get_articulation_controller()
+print(f"[PiperX] articulation controller: {type(articulation_controller).__name__}")
 
 motion_sequence = []
 current_pose_index = -1
 pose_hold_counter = 0
+current_target = None
+motion_frame = 0
+lula_action = None
+lula_solver = None
+art_kinematics = None
+ik_ui_window = None
+ik_ui_models = None
+ik_ui_status = None
+ik_target_base_position = None
+ik_target_base_orientation = None
+ik_target_marker = None
+
+if lula_yaml is not None:
+    lula_solver = LulaKinematicsSolver(robot_description_path=lula_yaml, urdf_path=lula_urdf)
+    robot_base_position = np.array([args.robot_x, args.robot_y, table_surface_z], dtype=np.float64)
+    robot_base_orientation = euler_angles_to_quats(np.array([0.0, 0.0, args.robot_yaw]), degrees=True)
+    lula_solver.set_robot_base_pose(robot_base_position, robot_base_orientation)
+    print(f"[Lula] YAML: {lula_yaml}")
+    print(f"[Lula] URDF: {lula_urdf}")
+    print(f"[Lula] active joints: {lula_solver.get_joint_names()}")
+    print(f"[Lula] base pose position: {robot_base_position}")
+    print(f"[Lula] base pose orientation (wxyz): {robot_base_orientation}")
+
+    if args.lula_list_frames:
+        print(f"[Lula] frames: {lula_solver.get_all_frame_names()}")
+        simulation_app.close()
+        sys.exit(0)
+
+    art_kinematics = ArticulationKinematicsSolver(robot, lula_solver, args.ee_frame)
+    ee_position, ee_rotation = art_kinematics.compute_end_effector_pose()
+    ik_target_base_position = np.array(ee_position, dtype=np.float32)
+    ik_target_base_orientation = rot_matrices_to_quats(np.asarray(ee_rotation))
+    print(f"[Lula] end effector frame: {args.ee_frame}")
+    print(f"[Lula] current ee position: {ee_position}")
+
+    if args.lula_ik_test:
+        target_position = ee_position + np.array([args.ik_target_dx, args.ik_target_dy, args.ik_target_dz], dtype=np.float32)
+        target_orientation = None if args.ik_position_only else ik_target_base_orientation
+        lula_action, lula_success = art_kinematics.compute_inverse_kinematics(
+            target_position=target_position, target_orientation=target_orientation
+        )
+        print(f"[Lula] target position: {target_position}")
+        print(f"[Lula] target orientation mode: {'position_only' if target_orientation is None else 'preserve_current'}")
+        print(f"[Lula] IK success: {lula_success}")
+        if lula_success:
+            print(f"[Lula] target joint positions: {lula_action.joint_positions}")
+            motion_sequence = []
+        else:
+            lula_action = None
+
+    if args.ik_ui:
+        ik_target_marker = create_target_marker(stage, "/World/Debug/IkTarget")
+        target_material = create_omnipbr_material(stage, "/World/Looks/IkTarget", color=(0.82, 0.16, 0.12), roughness=0.25)
+        bind_material(ik_target_marker, target_material)
+        initial_ui_target = ik_target_base_position + np.array(
+            [args.ik_target_dx, args.ik_target_dy, args.ik_target_dz], dtype=np.float32
+        )
+        ik_ui_window, ik_ui_models, ik_ui_status = build_ik_window(initial_ui_target)
+        print("[Lula] IK slider UI enabled")
 
 if args.test_motion:
     motion_sequence = get_test_poses(robot.num_dof)
     print("[PiperX] test motion enabled")
+elif args.circle_motion:
+    print("[PiperX] smooth circle-like motion enabled")
+elif args.lula_ik_test:
+    print("[Lula] IK motion enabled")
 
 while simulation_app.is_running():
-    if motion_sequence:
+    if args.ik_ui and art_kinematics is not None:
+        target_position = np.array(
+            [
+                ik_ui_models["x"].get_value_as_float(),
+                ik_ui_models["y"].get_value_as_float(),
+                ik_ui_models["z"].get_value_as_float(),
+            ],
+            dtype=np.float32,
+        )
+        orientation_offset = euler_angles_to_quats(
+            np.array(
+                [
+                    ik_ui_models["roll"].get_value_as_float(),
+                    ik_ui_models["pitch"].get_value_as_float(),
+                    ik_ui_models["yaw"].get_value_as_float(),
+                ],
+                dtype=np.float64,
+            ),
+            degrees=True,
+        )
+        target_orientation_quat = Gf.Quatf(float(ik_target_base_orientation[0]), Gf.Vec3f(*ik_target_base_orientation[1:])) * Gf.Quatf(
+            float(orientation_offset[0]), Gf.Vec3f(*orientation_offset[1:])
+        )
+        target_orientation = np.array(
+            [
+                float(target_orientation_quat.GetReal()),
+                float(target_orientation_quat.GetImaginary()[0]),
+                float(target_orientation_quat.GetImaginary()[1]),
+                float(target_orientation_quat.GetImaginary()[2]),
+            ],
+            dtype=np.float64,
+        )
+        set_translate(ik_target_marker, target_position)
+        lula_action, lula_success = art_kinematics.compute_inverse_kinematics(
+            target_position=target_position, target_orientation=target_orientation
+        )
+        ik_ui_status.set_value(
+            f"{'OK' if lula_success else 'FAIL'}  pos=({target_position[0]:.3f}, {target_position[1]:.3f}, {target_position[2]:.3f})"
+        )
+        if lula_success:
+            articulation_controller.apply_action(lula_action)
+    elif lula_action is not None:
+        articulation_controller.apply_action(lula_action)
+    elif args.circle_motion:
+        current_target = get_circle_motion_target(motion_frame, robot.num_dof)
+        robot.apply_action(ArticulationActions(joint_positions=current_target))
+        motion_frame += 1
+    elif motion_sequence:
         if pose_hold_counter <= 0:
             current_pose_index += 1
             if current_pose_index < len(motion_sequence):
                 pose_name, pose = motion_sequence[current_pose_index]
-                robot.set_joint_positions(pose)
+                current_target = pose[0].copy()
+                robot.apply_action(ArticulationActions(joint_positions=current_target))
                 print(f"[PiperX] commanded pose '{pose_name}': {pose.tolist()[0]}")
                 pose_hold_counter = args.hold_frames
             else:
@@ -371,6 +587,8 @@ while simulation_app.is_running():
                 current_positions = robot.get_joint_positions()
                 print(f"[PiperX] motion sequence complete, current joints: {current_positions}")
         else:
+            if current_target is not None:
+                robot.apply_action(ArticulationActions(joint_positions=current_target))
             pose_hold_counter -= 1
     world.step(render=True)
 

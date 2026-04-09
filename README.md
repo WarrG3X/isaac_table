@@ -23,7 +23,7 @@ Known-good current state:
 - `simple_floor_table.py` builds the table/bin scene and overhead RealSense-style RGB-D camera.
 - RGB, depth, and custom instance segmentation capture are working.
 - YCB object dropping works from the local Isaac `Materials & Props` asset pack.
-- `piper_x_scene.py` loads one Piper X onto the table from the shipped AgileX USD.
+- `piper/piper_x_scene.py` loads one Piper X onto the table from the shipped AgileX USD.
 - The current Piper motion test confirms articulation access and joint actuation wiring.
 
 Known caveats:
@@ -46,7 +46,10 @@ Recommended next steps:
 
 - `simple_floor_table.backup.py`: baseline scene with table, side bin, lighting, and camera.
 - `simple_floor_table.py`: clutter drop pipeline using procedural objects, with RGB and depth capture after the objects settle in the bin.
-- `piper_x_scene.py`: single-arm Piper X scene on the table, using the cloned `piper_isaac_sim` robot USD.
+- `piper/piper_x_scene.py`: single-arm Piper X scene on the table, using the cloned `piper_isaac_sim` robot USD.
+- `piper/piper_x_joint_debug.py`: joint-space slider debug scene with colored frame markers and live link positions.
+- `piper/piper_x_square_loop.py`: task-space square loop under a fixed tool orientation.
+- `piper/piper_x_circle_loop.py`: task-space circle loop under a fixed tool orientation.
 
 ## Run
 
@@ -87,20 +90,20 @@ C:\Users\Warra\Downloads\Isaac\piper_isaac_sim\USD\piper_x_v1.usd
 Run the single-arm Piper scene:
 
 ```powershell
-.\python.bat standalone_examples\user\isaac_table\piper_x_scene.py
+.\python.bat standalone_examples\user\isaac_table\piper\piper_x_scene.py
 ```
 
 Run the simple joint-space motion test:
 
 ```powershell
-.\python.bat standalone_examples\user\isaac_table\piper_x_scene.py --test-motion
+.\python.bat standalone_examples\user\isaac_table\piper\piper_x_scene.py --test-motion
 ```
 
 Useful Piper options:
 
 ```powershell
-.\python.bat standalone_examples\user\isaac_table\piper_x_scene.py --robot-y 0.18
-.\python.bat standalone_examples\user\isaac_table\piper_x_scene.py --test-motion --hold-frames 120
+.\python.bat standalone_examples\user\isaac_table\piper\piper_x_scene.py --robot-y 0.18
+.\python.bat standalone_examples\user\isaac_table\piper\piper_x_scene.py --test-motion --hold-frames 120
 ```
 
 Notes:
@@ -108,6 +111,24 @@ Notes:
 - The scene uses the shipped `piper_x_v1.usd`, not a fresh URDF import.
 - This is intentional on Windows because the cloned repo has mesh filename case collisions such as `base_Link.dae` vs `base_link.dae`.
 - The current motion test uses direct joint state setting to validate articulation access. It is not yet a smooth controller.
+
+## Robot Debug
+
+Useful Piper/Lula debug scripts:
+
+```powershell
+.\python.bat standalone_examples\user\isaac_table\piper\piper_x_joint_debug.py
+.\python.bat standalone_examples\user\isaac_table\piper\piper_x_scene.py --ik-ui
+.\python.bat standalone_examples\user\isaac_table\piper\piper_x_square_loop.py
+.\python.bat standalone_examples\user\isaac_table\piper\piper_x_circle_loop.py
+```
+
+Notes:
+
+- `piper_x_joint_debug.py` is the frame-debugger: joint sliders, colored link markers, and live link positions.
+- `piper_x_scene.py --ik-ui` is the interactive world-space IK target tool with rotation sliders.
+- `piper_x_square_loop.py` uses the canonical task-space pose and traces a clockwise square in XY.
+- `piper_x_circle_loop.py` uses the same canonical pose and streams dense circle targets for a smoother loop.
 
 ## YCB Assets
 
