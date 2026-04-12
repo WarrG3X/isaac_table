@@ -504,6 +504,7 @@ world.reset()
 robot.initialize()
 articulation_controller = robot.get_articulation_controller()
 lula_joint_names = list(robot.dof_names)
+joint_name_to_index = {name: idx for idx, name in enumerate(lula_joint_names)}
 dof_props = robot.dof_properties
 joint7_idx = lula_joint_names.index("joint7")
 joint8_idx = lula_joint_names.index("joint8")
@@ -520,9 +521,25 @@ robot_base_position = np.array([args.robot_x, args.robot_y, table_surface_z], dt
 robot_base_orientation = euler_angles_to_quats(np.array([0.0, 0.0, args.robot_yaw]), degrees=True)
 lula_solver.set_robot_base_pose(robot_base_position, robot_base_orientation)
 art_kinematics = ArticulationKinematicsSolver(robot, lula_solver, args.ee_frame)
+print(f"[PiperX] Lula active joints: {lula_solver.get_joint_names()}")
+
+stiffnesses = np.asarray(dof_props["stiffness"], dtype=np.float32).copy()
+dampings = np.asarray(dof_props["damping"], dtype=np.float32).copy()
+max_efforts = np.asarray(dof_props["maxEffort"], dtype=np.float32).copy()
+for gripper_joint in ("joint7", "joint8"):
+    idx = joint_name_to_index[gripper_joint]
+    stiffnesses[idx] = max(stiffnesses[idx], 4000.0)
+    dampings[idx] = max(dampings[idx], 120.0)
+    max_efforts[idx] = max(max_efforts[idx], 1000.0)
+robot._articulation_view.set_gains(kps=stiffnesses.reshape(1, -1), kds=dampings.reshape(1, -1))
+robot._articulation_view.set_max_efforts(max_efforts.reshape(1, -1))
+print("[PiperX] applied gripper hold override on joint7/8")
+
 ee_position, ee_rotation = art_kinematics.compute_end_effector_pose()
 target_position = np.array(ee_position, dtype=np.float32)
 target_orientation = rot_matrices_to_quats(np.asarray(ee_rotation))
+initial_target_position = target_position.copy()
+initial_target_orientation = np.asarray(target_orientation, dtype=np.float64).copy()
 set_translate(target_marker.GetPrim(), target_position)
 status_window, status_model = build_status_window(target_position)
 print(f"[PiperX] SpaceMouse XYZ teleop using frame: {args.ee_frame}")
@@ -534,6 +551,7 @@ reader = SpaceMouseReader(args.vendor_id, args.product_id)
 reader.start_in_thread()
 last_buttons = 0
 gripper_open = True
+last_valid_targets = np.asarray(robot.get_joint_positions(), dtype=np.float32).copy()
 
 
 def handle_signal(_signum, _frame):
@@ -580,16 +598,27 @@ while simulation_app.is_running():
     if (buttons & 0x01) and not (last_buttons & 0x01):
         gripper_open = not gripper_open
         print(f"[SpaceMouse] gripper toggled -> {'open' if gripper_open else 'closed'}")
+    if (buttons & 0x02) and not (last_buttons & 0x02):
+        target_position = initial_target_position.copy()
+        target_orientation = initial_target_orientation.copy()
+        print("[SpaceMouse] target reset -> initial pose")
 
     action, success = art_kinematics.compute_inverse_kinematics(target_position=target_position, target_orientation=target_orientation)
+    finger_targets = gripper_open_target if gripper_open else gripper_closed_target
     if success:
-        joint_positions = np.array(action.joint_positions, dtype=np.float32).copy()
-        if joint_positions.shape[0] >= 8:
-            finger_targets = gripper_open_target if gripper_open else gripper_closed_target
-            joint_positions[joint7_idx] = finger_targets[0]
-            joint_positions[joint8_idx] = finger_targets[1]
-            action = ArticulationAction(joint_positions=joint_positions)
-        articulation_controller.apply_action(action)
+        full_targets = np.asarray(robot.get_joint_positions(), dtype=np.float32).copy()
+        lula_targets = np.asarray(action.joint_positions, dtype=np.float32).reshape(-1)
+        for lula_idx, joint_name in enumerate(lula_solver.get_joint_names()):
+            full_targets[joint_name_to_index[joint_name]] = lula_targets[lula_idx]
+        full_targets[joint7_idx] = finger_targets[0]
+        full_targets[joint8_idx] = finger_targets[1]
+        last_valid_targets = full_targets.copy()
+        articulation_controller.apply_action(ArticulationAction(joint_positions=full_targets))
+    else:
+        fallback_targets = last_valid_targets.copy()
+        fallback_targets[joint7_idx] = finger_targets[0]
+        fallback_targets[joint8_idx] = finger_targets[1]
+        articulation_controller.apply_action(ArticulationAction(joint_positions=fallback_targets))
 
     if buttons != last_buttons:
         print(f"[SpaceMouse] buttons=0x{buttons:02x} target=({target_position[0]:.3f}, {target_position[1]:.3f}, {target_position[2]:.3f}) ik={success}")

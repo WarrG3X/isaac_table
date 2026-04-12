@@ -13,18 +13,16 @@ cspace:
     - joint4
     - joint5
     - joint6
-    - joint7
-    - joint8
 default_q: [
-    1e-04,-0.0,-0.0033,-0.0188,-0.0012,-0.0008,0.0,-0.0005
+    1e-04,-0.0,-0.0033,-0.0188,-0.0012,-0.0008
 ]
 
 acceleration_limits: [
-   10,10,10,10,10,10,10,10
+   10,10,10,10,10,10
 ]
 
 jerk_limits: [
-   10000,10000,10000,10000,10000,10000,10000,10000
+   10000,10000,10000,10000,10000,10000
 ]
 
 # Most dimensions of the cspace have a direct corresponding element
@@ -38,19 +36,6 @@ cspace_to_urdf_rules:
 # not be able to avoid obstacles.
 
 collision_spheres:
-  - Link6:
-    - "center": [0.0, 0.0, 0.0]
-      "radius": 0.05
-    - "center": [0.0, 0.0, 0.0]
-      "radius": 0.05
-    - "center": [0.0, 0.0, 0.02]
-      "radius": 0.05
-    - "center": [-0.025, 0.0, 0.031]
-      "radius": 0.04
-    - "center": [-0.05, 0.0, 0.031]
-      "radius": 0.04
-    - "center": [0.05, 0.0, 0.031]
-      "radius": 0.04
   - Link5:
     - "center": [0.0, 0.0, 0.0]
       "radius": 0.05
@@ -176,33 +161,3 @@ collision_spheres:
   - base_link:
     - "center": [0.0, 0.0, 0.0]
       "radius": 0.1
-  - Link7:
-    - "center": [-0.01, -0.05, -0.015]
-      "radius": 0.015
-    - "center": [0.0, -0.05, -0.015]
-      "radius": 0.015
-    - "center": [0.01, -0.05, -0.015]
-      "radius": 0.015
-    - "center": [0.01, -0.05, -0.015]
-      "radius": 0.015
-    - "center": [0.01, -0.05, 0.015]
-      "radius": 0.015
-    - "center": [0.0, -0.05, 0.015]
-      "radius": 0.015
-    - "center": [0.01, -0.05, 0.015]
-      "radius": 0.015
-    - "center": [-0.01, -0.05, 0.015]
-      "radius": 0.015
-  - Link8:
-    - "center": [0.0, 0.0, -0.005]
-      "radius": 0.005
-    - "center": [0.0, 0.0, 0.005]
-      "radius": 0.005
-    - "center": [-0.007, 0.0, 0.005]
-      "radius": 0.005
-    - "center": [0.007, 0.0, 0.005]
-      "radius": 0.005
-    - "center": [0.007, 0.0, -0.005]
-      "radius": 0.005
-    - "center": [-0.007, 0.0, -0.005]
-      "radius": 0.005
