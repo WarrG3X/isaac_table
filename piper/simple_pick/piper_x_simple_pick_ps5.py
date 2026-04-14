@@ -3,6 +3,7 @@ from isaacsim import SimulationApp
 simulation_app = SimulationApp({"headless": False})
 
 import argparse
+import concurrent.futures
 import json
 import os
 import time
@@ -187,7 +188,15 @@ def create_episode_buffer():
     }
 
 
-def save_episode(output_dir, episode, task_name, source_pad_center, target_pad_center, cube_start, ee_frame):
+def save_rgb_frame(rgb, path, image_format, jpeg_quality):
+    image = Image.fromarray(rgb)
+    if image_format == "jpg":
+        image.save(path, format="JPEG", quality=int(jpeg_quality), optimize=True)
+    else:
+        image.save(path, format="PNG")
+
+
+def save_episode(output_dir, episode, task_name, source_pad_center, target_pad_center, cube_start, ee_frame, image_format, jpeg_quality):
     os.makedirs(output_dir, exist_ok=True)
     episode_id = time.strftime("episode_%Y%m%d_%H%M%S")
     episode_dir = os.path.join(output_dir, episode_id)
@@ -200,11 +209,12 @@ def save_episode(output_dir, episode, task_name, source_pad_center, target_pad_c
     wrist_dir = os.path.join(episode_dir, "images", "wrist")
     os.makedirs(top_dir, exist_ok=True)
     os.makedirs(wrist_dir, exist_ok=True)
+    image_ext = "jpg" if image_format == "jpg" else "png"
 
     for idx, rgb in enumerate(episode["top_rgb"]):
-        Image.fromarray(rgb).save(os.path.join(top_dir, f"{idx:06d}.png"))
+        save_rgb_frame(rgb, os.path.join(top_dir, f"{idx:06d}.{image_ext}"), image_format=image_format, jpeg_quality=jpeg_quality)
     for idx, rgb in enumerate(episode["wrist_rgb"]):
-        Image.fromarray(rgb).save(os.path.join(wrist_dir, f"{idx:06d}.png"))
+        save_rgb_frame(rgb, os.path.join(wrist_dir, f"{idx:06d}.{image_ext}"), image_format=image_format, jpeg_quality=jpeg_quality)
 
     np.savez_compressed(
         os.path.join(episode_dir, "data.npz"),
@@ -231,6 +241,7 @@ def save_episode(output_dir, episode, task_name, source_pad_center, target_pad_c
             "top": "images/top",
             "wrist": "images/wrist",
         },
+        "image_format": image_ext,
         "data_file": "data.npz",
     }
     with open(os.path.join(episode_dir, "metadata.json"), "w", encoding="utf-8") as f:
@@ -330,6 +341,9 @@ parser.add_argument("--table-width", type=float, default=1.40)
 parser.add_argument("--table-depth", type=float, default=1.55)
 parser.add_argument("--cube-size", type=float, default=0.05)
 parser.add_argument("--data-dir", type=str, default=DEFAULT_DATA_DIR)
+parser.add_argument("--camera-panels", action="store_true")
+parser.add_argument("--image-format", type=str, choices=["jpg", "png"], default="png")
+parser.add_argument("--jpeg-quality", type=int, default=85)
 args, _ = parser.parse_known_args()
 
 world = World(stage_units_in_meters=1.0)
@@ -425,8 +439,8 @@ robot_camera_prim = create_robot_camera(stage, "/World/RobotMount/PiperX/Robot/p
 topdown_camera_prim = create_topdown_camera(stage, "/World/Debug/TopDownCamera", center=task_center, coverage_xy=task_coverage_xy)
 topdown_sensor_camera = None
 robot_sensor_camera = None
-topdown_provider = ui.ByteImageProvider()
-robot_provider = ui.ByteImageProvider()
+topdown_provider = ui.ByteImageProvider() if args.camera_panels else None
+robot_provider = ui.ByteImageProvider() if args.camera_panels else None
 topdown_window = None
 robot_window = None
 
@@ -450,8 +464,9 @@ pointer_marker.CreateRadiusAttr(0.014)
 bind_material(pointer_marker.GetPrim(), target_pad_material)
 
 set_camera_view(eye=[0.0, 1.85, 1.55], target=[0.0, 0.02, 0.82], camera_prim_path="/OmniverseKit_Persp")
-topdown_window = build_camera_window("Simple Pick Top Down", topdown_provider, 640, 480, 980, 40)
-robot_window = build_camera_window("Simple Pick Wrist", robot_provider, 640, 480, 980, 560)
+if args.camera_panels:
+    topdown_window = build_camera_window("Simple Pick Top Down", topdown_provider, 640, 480, 980, 40)
+    robot_window = build_camera_window("Simple Pick Wrist", robot_provider, 640, 480, 980, 560)
 
 world.reset()
 robot.initialize()
@@ -476,8 +491,10 @@ print(f"[SimplePick] source pad center: {source_pad_center}")
 print(f"[SimplePick] target pad center: {target_pad_center}")
 print(f"[SimplePick] cube start: {cube_center.tolist()}")
 print(f"[SimplePick] Lula active joints: {lula_solver.get_joint_names()}")
-print(f"[SimplePick] top-down camera panel: {topdown_window.title}")
-print(f"[SimplePick] wrist camera panel: {robot_window.title}")
+print(f"[SimplePick] camera panels: {'enabled' if args.camera_panels else 'disabled'}")
+if args.camera_panels:
+    print(f"[SimplePick] top-down camera panel: {topdown_window.title}")
+    print(f"[SimplePick] wrist camera panel: {robot_window.title}")
 
 stiffnesses = np.asarray(dof_props["stiffness"], dtype=np.float32).copy()
 dampings = np.asarray(dof_props["damping"], dtype=np.float32).copy()
@@ -525,15 +542,27 @@ success_latched = False
 recording = False
 episode = None
 episode_step_index = 0
+save_executor = concurrent.futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix="episode_save")
+save_futures = []
 print("[PS5] controls:")
 print("[PS5] left stick -> X/Y")
 print("[PS5] triggers -> Z down/up")
 print("[PS5] right stick -> roll/pitch")
 print("[PS5] L1/R1 -> yaw -/+")
 print("[PS5] Cross -> gripper toggle | Circle -> reset/discard | Square -> start/stop recording")
+print(f"[PS5] recording image format: {args.image_format}")
 
 try:
     while simulation_app.is_running():
+        still_pending = []
+        for future in save_futures:
+            if future.done():
+                episode_dir = future.result()
+                print(f"[PS5] save complete -> {episode_dir}")
+            else:
+                still_pending.append(future)
+        save_futures = still_pending
+
         pygame.event.pump()
 
         lx = float(joystick.get_axis(0)) if joystick.get_numaxes() > 0 else 0.0
@@ -607,16 +636,21 @@ try:
             else:
                 recording = False
                 episode["success"] = bool(episode["success"] or success_latched)
-                episode_dir = save_episode(
-                    output_dir=os.path.abspath(args.data_dir),
-                    episode=episode,
-                    task_name="simple_pick_red_to_blue",
-                    source_pad_center=source_pad_center,
-                    target_pad_center=target_pad_center,
-                    cube_start=initial_cube_position,
-                    ee_frame=args.ee_frame,
+                save_futures.append(
+                    save_executor.submit(
+                        save_episode,
+                        output_dir=os.path.abspath(args.data_dir),
+                        episode=episode,
+                        task_name="simple_pick_red_to_blue",
+                        source_pad_center=source_pad_center,
+                        target_pad_center=target_pad_center,
+                        cube_start=initial_cube_position,
+                        ee_frame=args.ee_frame,
+                        image_format=args.image_format,
+                        jpeg_quality=args.jpeg_quality,
+                    )
                 )
-                print(f"[PS5] recording stopped -> saved {episode_dir}")
+                print("[PS5] recording stopped -> saving in background")
                 episode = None
         if 1 in buttons and 1 not in last_buttons:
             if recording:
@@ -696,9 +730,9 @@ try:
         world.step(render=True)
         top_rgba = np.asarray(topdown_sensor_camera.get_rgba(device="cpu"), dtype=np.uint8)
         wrist_rgba = np.asarray(robot_sensor_camera.get_rgba(device="cpu"), dtype=np.uint8)
-        if top_rgba.ndim == 3:
+        if args.camera_panels and top_rgba.ndim == 3:
             update_camera_provider_from_rgba(topdown_provider, top_rgba)
-        if wrist_rgba.ndim == 3:
+        if args.camera_panels and wrist_rgba.ndim == 3:
             update_camera_provider_from_rgba(robot_provider, wrist_rgba)
         if recording and episode is not None and top_rgba.ndim == 3 and wrist_rgba.ndim == 3:
             episode["top_rgb"].append(top_rgba[:, :, :3].copy())
@@ -719,6 +753,7 @@ try:
             )
             episode_step_index += 1
 finally:
+    save_executor.shutdown(wait=False)
     joystick.quit()
     pygame.joystick.quit()
     pygame.quit()
