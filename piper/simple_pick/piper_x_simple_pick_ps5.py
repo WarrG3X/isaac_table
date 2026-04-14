@@ -17,6 +17,7 @@ from isaacsim.core.utils.stage import add_reference_to_stage
 from isaacsim.core.utils.types import ArticulationAction
 from isaacsim.core.utils.viewports import set_camera_view
 from isaacsim.robot_motion.motion_generation import ArticulationKinematicsSolver, LulaKinematicsSolver
+from isaacsim.sensors.camera import Camera
 from pxr import Gf, Sdf, UsdGeom, UsdLux, UsdShade, Vt
 
 
@@ -99,6 +100,39 @@ def set_translate(prim, translate):
         xformable.AddTranslateOp().Set(Gf.Vec3d(tx, ty, tz))
 
 
+def create_robot_camera(stage, prim_path):
+    mount = UsdGeom.Xform.Define(stage, prim_path)
+    mount_xform = UsdGeom.Xformable(mount.GetPrim())
+    mount_xform.AddTranslateOp().Set(Gf.Vec3d(0.03, 0.0, 0.0))
+    mount_xform.AddRotateXYZOp().Set(Gf.Vec3f(-90.0, 0.0, 90.0))
+
+    camera = UsdGeom.Camera.Define(stage, f"{prim_path}/Sensor")
+    camera_xform = UsdGeom.Xformable(camera.GetPrim())
+    camera_xform.AddRotateXYZOp().Set(Gf.Vec3f(0.0, 0.0, 180.0))
+    camera.CreateFocalLengthAttr(2.79)
+    camera.CreateHorizontalApertureAttr(3.84)
+    camera.CreateVerticalApertureAttr(2.88)
+    camera.CreateClippingRangeAttr(Gf.Vec2f(0.02, 8.0))
+    return camera.GetPrim()
+
+
+def create_topdown_camera(stage, prim_path, center, coverage_xy):
+    camera = UsdGeom.Camera.Define(stage, prim_path)
+    xform = UsdGeom.Xformable(camera.GetPrim())
+    focal_length = 18.0
+    horizontal_aperture = 20.955
+    vertical_aperture = 15.2908
+    required_height_x = float(coverage_xy[0]) * focal_length / horizontal_aperture
+    required_height_y = float(coverage_xy[1]) * focal_length / vertical_aperture
+    camera_height = 2.0 * (max(required_height_x, required_height_y) + 0.10)
+    xform.AddTranslateOp().Set(Gf.Vec3d(float(center[0]), float(center[1]), float(center[2] + camera_height)))
+    camera.CreateFocalLengthAttr(focal_length)
+    camera.CreateHorizontalApertureAttr(horizontal_aperture)
+    camera.CreateVerticalApertureAttr(vertical_aperture)
+    camera.CreateClippingRangeAttr(Gf.Vec2f(0.02, 12.0))
+    return camera.GetPrim()
+
+
 def build_status_window(initial_position):
     text_model = ui.SimpleStringModel("")
     window = ui.Window("Simple Pick Teleop", width=460, height=140, visible=True)
@@ -113,6 +147,26 @@ def build_status_window(initial_position):
                 ui.StringField(model=text_model, read_only=True)
     text_model.set_value(f"({initial_position[0]:.3f}, {initial_position[1]:.3f}, {initial_position[2]:.3f})")
     return window, text_model
+
+
+def build_camera_window(title, provider, width, height, pos_x, pos_y):
+    window = ui.Window(title, width=width + 20, height=height + 40, visible=True)
+    window.position_x = pos_x
+    window.position_y = pos_y
+    with window.frame:
+        with ui.VStack():
+            ui.ImageWithProvider(provider, width=width, height=height)
+    return window
+
+
+def update_camera_provider(camera, provider):
+    rgba = np.asarray(camera.get_rgba(device="cpu"), dtype=np.uint8)
+    if rgba.ndim != 3 or rgba.shape[0] == 0 or rgba.shape[1] == 0:
+        return
+    if rgba.shape[2] == 3:
+        alpha = np.full((rgba.shape[0], rgba.shape[1], 1), 255, dtype=np.uint8)
+        rgba = np.concatenate([rgba, alpha], axis=2)
+    provider.set_bytes_data(bytearray(rgba.tobytes()), [int(rgba.shape[1]), int(rgba.shape[0])])
 
 
 def quat_multiply_wxyz(q1, q2):
@@ -265,6 +319,8 @@ pad_z = table_surface_z + 0.002
 pad_y = 0.22
 source_pad_center = (-0.16, pad_y, pad_z)
 target_pad_center = (0.16, pad_y, pad_z)
+task_center = (0.5 * (source_pad_center[0] + target_pad_center[0]), 0.5 * (source_pad_center[1] + target_pad_center[1]), table_surface_z)
+task_coverage_xy = (abs(target_pad_center[0] - source_pad_center[0]) + pad_size[0] + 0.18, pad_size[1] + 0.22)
 source_pad = define_uv_plane(stage, "/World/SourcePad/Plane", size=pad_size, translate=source_pad_center)
 bind_material(source_pad, source_pad_material)
 target_pad = define_uv_plane(stage, "/World/TargetPad/Plane", size=pad_size, translate=target_pad_center)
@@ -295,6 +351,14 @@ mount_xform.AddRotateXYZOp().Set(Gf.Vec3f(0.0, 0.0, args.robot_yaw))
 add_reference_to_stage(usd_path=os.path.abspath(args.robot_usd), prim_path="/World/RobotMount/PiperX/Robot")
 deactivate_embedded_environment(stage, "/World/RobotMount/PiperX/Robot")
 robot = SingleArticulation(prim_path="/World/RobotMount/PiperX/Robot", name="piper_x")
+robot_camera_prim = create_robot_camera(stage, "/World/RobotMount/PiperX/Robot/piper_x_camera/camera_link/DebugCamera")
+topdown_camera_prim = create_topdown_camera(stage, "/World/Debug/TopDownCamera", center=task_center, coverage_xy=task_coverage_xy)
+topdown_sensor_camera = None
+robot_sensor_camera = None
+topdown_provider = ui.ByteImageProvider()
+robot_provider = ui.ByteImageProvider()
+topdown_window = None
+robot_window = None
 
 cube_center = np.array([source_pad_center[0], source_pad_center[1], table_surface_z + args.cube_size * 0.5 + 0.002], dtype=np.float32)
 cube = DynamicCuboid(
@@ -316,9 +380,15 @@ pointer_marker.CreateRadiusAttr(0.014)
 bind_material(pointer_marker.GetPrim(), target_pad_material)
 
 set_camera_view(eye=[0.0, 1.85, 1.55], target=[0.0, 0.02, 0.82], camera_prim_path="/OmniverseKit_Persp")
+topdown_window = build_camera_window("Simple Pick Top Down", topdown_provider, 640, 480, 980, 40)
+robot_window = build_camera_window("Simple Pick Wrist", robot_provider, 640, 480, 980, 560)
 
 world.reset()
 robot.initialize()
+robot_sensor_camera = Camera(prim_path=str(robot_camera_prim.GetPath()), frequency=30, resolution=(640, 480))
+topdown_sensor_camera = Camera(prim_path=str(topdown_camera_prim.GetPath()), frequency=30, resolution=(640, 480))
+robot_sensor_camera.initialize()
+topdown_sensor_camera.initialize()
 articulation_controller = robot.get_articulation_controller()
 joint_names = list(robot.dof_names)
 joint_name_to_index = {name: idx for idx, name in enumerate(joint_names)}
@@ -336,6 +406,8 @@ print(f"[SimplePick] source pad center: {source_pad_center}")
 print(f"[SimplePick] target pad center: {target_pad_center}")
 print(f"[SimplePick] cube start: {cube_center.tolist()}")
 print(f"[SimplePick] Lula active joints: {lula_solver.get_joint_names()}")
+print(f"[SimplePick] top-down camera panel: {topdown_window.title}")
+print(f"[SimplePick] wrist camera panel: {robot_window.title}")
 
 stiffnesses = np.asarray(dof_props["stiffness"], dtype=np.float32).copy()
 dampings = np.asarray(dof_props["damping"], dtype=np.float32).copy()
@@ -521,6 +593,8 @@ try:
             last_buttons = buttons
 
         world.step(render=True)
+        update_camera_provider(topdown_sensor_camera, topdown_provider)
+        update_camera_provider(robot_sensor_camera, robot_provider)
 finally:
     joystick.quit()
     pygame.joystick.quit()
