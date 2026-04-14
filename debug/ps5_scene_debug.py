@@ -15,6 +15,7 @@ from pxr import Gf, Sdf, UsdGeom, UsdLux, UsdShade, Vt
 
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+REPO_ROOT = os.path.abspath(os.path.join(SCRIPT_DIR, ".."))
 
 
 def define_box(stage, prim_path, size, translate):
@@ -140,8 +141,8 @@ UsdGeom.Xform.Define(stage, "/World/Table")
 UsdGeom.Xform.Define(stage, "/World/Debug")
 UsdGeom.Xform.Define(stage, "/World/Lights")
 
-granite_texture_path = os.path.join(SCRIPT_DIR, "materials", "nv_granite_tile.jpg")
-bamboo_texture_path = os.path.join(SCRIPT_DIR, "materials", "nv_bamboo_desktop.jpg")
+granite_texture_path = os.path.join(REPO_ROOT, "materials", "nv_granite_tile.jpg")
+bamboo_texture_path = os.path.join(REPO_ROOT, "materials", "nv_bamboo_desktop.jpg")
 
 floor_material_base = create_omnipbr_material(stage, "/World/Looks/FloorBase", color=(0.44, 0.46, 0.48), roughness=0.72)
 floor_material = create_omnipbr_material(

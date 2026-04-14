@@ -20,6 +20,7 @@ from isaacsim.core.utils.viewports import set_camera_view
 
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+REPO_ROOT = os.path.abspath(os.path.join(SCRIPT_DIR, ".."))
 
 user32 = ctypes.WinDLL("user32", use_last_error=True)
 kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
@@ -392,8 +393,8 @@ UsdGeom.Xform.Define(stage, "/World/Table")
 UsdGeom.Xform.Define(stage, "/World/Marker")
 UsdGeom.Xform.Define(stage, "/World/Lights")
 
-bamboo_texture_path = os.path.join(SCRIPT_DIR, "materials", "nv_bamboo_desktop.jpg")
-granite_texture_path = os.path.join(SCRIPT_DIR, "materials", "nv_granite_tile.jpg")
+bamboo_texture_path = os.path.join(REPO_ROOT, "materials", "nv_bamboo_desktop.jpg")
+granite_texture_path = os.path.join(REPO_ROOT, "materials", "nv_granite_tile.jpg")
 
 floor_material_base = create_omnipbr_material(stage, "/World/Looks/FloorBase", color=(0.44, 0.46, 0.48), roughness=0.72)
 floor_material = create_omnipbr_material(
