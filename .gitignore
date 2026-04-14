@@ -191,6 +191,9 @@ cython_debug/
 # Omniverse / Isaac generated previews
 .thumbs/
 
+# Dataset artifacts
+data/
+
 # Ruff stuff:
 .ruff_cache/
 
