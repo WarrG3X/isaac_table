@@ -25,8 +25,8 @@ Known-good current state:
 - `simple_floor_table.py` builds the table/bin scene and overhead RealSense-style RGB-D camera.
 - RGB, depth, and custom instance segmentation capture are working.
 - YCB object dropping works from the local Isaac `Materials & Props` asset pack.
-- `piper/piper_x_scene.py` loads one Piper X onto the table from the shipped AgileX USD.
-- The current Piper motion test confirms articulation access and joint actuation wiring.
+- `piper/bin_pick/piper_x_scene.py` loads one Piper X onto the table from the shipped AgileX USD.
+- `piper/simple_pick/piper_x_simple_pick_ps5.py` provides PS5 teleop for the simple pick/place POC.
 
 Known caveats:
 
@@ -44,14 +44,12 @@ Recommended next steps:
 3. Verify end-effector frame orientation and gripper behavior.
 4. Duplicate and mirror the setup into a dual-arm table scene.
 
-## Files
+## Layout
 
-- `simple_floor_table.backup.py`: baseline scene with table, side bin, lighting, and camera.
-- `simple_floor_table.py`: clutter drop pipeline using procedural objects, with RGB and depth capture after the objects settle in the bin.
-- `piper/piper_x_scene.py`: single-arm Piper X scene on the table, using the cloned `piper_isaac_sim` robot USD.
-- `piper/piper_x_joint_debug.py`: joint-space slider debug scene with colored frame markers and live link positions.
-- `piper/piper_x_square_loop.py`: task-space square loop under a fixed tool orientation.
-- `piper/piper_x_circle_loop.py`: task-space circle loop under a fixed tool orientation.
+- `simple_floor_table.py`: tabletop bin scene with clutter drop and top-down RGB-D capture.
+- `debug/`: controller and robot-debug scripts.
+- `piper/bin_pick/`: Piper tabletop bin-pick scenes and teleop utilities.
+- `piper/simple_pick/`: simpler red-to-blue pick/place POC scenes.
 
 ## Run
 
@@ -92,51 +90,55 @@ C:\Users\Warra\Downloads\Isaac\piper_isaac_sim\USD\piper_x_v1.usd
 Run the single-arm Piper scene:
 
 ```powershell
-.\python.bat standalone_examples\user\isaac_table\piper\piper_x_scene.py
+.\python.bat standalone_examples\user\isaac_table\piper\bin_pick\piper_x_scene.py
 ```
 
 Run the unified Piper scene with clutter and the top-down camera:
 
 ```powershell
-.\python.bat standalone_examples\user\isaac_table\piper\piper_x_scene.py --object-source ycb --robot-camera-view --joint-ui --topdown-camera
+.\python.bat standalone_examples\user\isaac_table\piper\bin_pick\piper_x_scene.py --object-source ycb --robot-camera-view --joint-ui --topdown-camera
 ```
 
-Run the simple joint-space motion test:
+Run the simple pick/place PS5 teleop scene:
 
 ```powershell
-.\python.bat standalone_examples\user\isaac_table\piper\piper_x_scene.py --test-motion
+.\python.bat standalone_examples\user\isaac_table\piper\simple_pick\piper_x_simple_pick_ps5.py
 ```
 
 Useful Piper options:
 
 ```powershell
-.\python.bat standalone_examples\user\isaac_table\piper\piper_x_scene.py --robot-y 0.18
-.\python.bat standalone_examples\user\isaac_table\piper\piper_x_scene.py --test-motion --hold-frames 120
+.\python.bat standalone_examples\user\isaac_table\piper\bin_pick\piper_x_scene.py --robot-y 0.18
+.\python.bat standalone_examples\user\isaac_table\piper\simple_pick\piper_x_simple_pick_ps5.py --translation-scale 0.0018
 ```
 
 Notes:
 
 - The scene uses the shipped `piper_x_v1.usd`, not a fresh URDF import.
 - This is intentional on Windows because the cloned repo has mesh filename case collisions such as `base_Link.dae` vs `base_link.dae`.
-- The current motion test uses direct joint state setting to validate articulation access. It is not yet a smooth controller.
+- Lula is configured arm-only for IK. Gripper control is handled separately.
 
 ## Robot Debug
 
 Useful Piper/Lula debug scripts:
 
 ```powershell
-.\python.bat standalone_examples\user\isaac_table\piper\piper_x_joint_debug.py
-.\python.bat standalone_examples\user\isaac_table\piper\piper_x_scene.py --ik-ui
-.\python.bat standalone_examples\user\isaac_table\piper\piper_x_square_loop.py
-.\python.bat standalone_examples\user\isaac_table\piper\piper_x_circle_loop.py
+.\python.bat standalone_examples\user\isaac_table\debug\piper_x_joint_debug.py
+.\python.bat standalone_examples\user\isaac_table\piper\bin_pick\piper_x_scene.py --ik-ui
+.\python.bat standalone_examples\user\isaac_table\piper\bin_pick\piper_x_square_loop.py
+.\python.bat standalone_examples\user\isaac_table\piper\bin_pick\piper_x_circle_loop.py
+.\python.bat standalone_examples\user\isaac_table\debug\ps5_debug.py
+.\python.bat standalone_examples\user\isaac_table\debug\ps5_scene_debug.py
 ```
 
 Notes:
 
-- `piper_x_joint_debug.py` is the frame-debugger: joint sliders, colored link markers, and live link positions.
-- `piper_x_scene.py --ik-ui` is the interactive world-space IK target tool with rotation sliders.
-- `piper_x_square_loop.py` uses the canonical task-space pose and traces a clockwise square in XY.
-- `piper_x_circle_loop.py` uses the same canonical pose and streams dense circle targets for a smoother loop.
+- `debug/piper_x_joint_debug.py` is the frame-debugger: joint sliders, colored link markers, and live link positions.
+- `piper/bin_pick/piper_x_scene.py --ik-ui` is the interactive world-space IK target tool with rotation sliders.
+- `piper/bin_pick/piper_x_square_loop.py` uses the canonical task-space pose and traces a clockwise square in XY.
+- `piper/bin_pick/piper_x_circle_loop.py` uses the same canonical pose and streams dense circle targets for a smoother loop.
+- `debug/ps5_debug.py` is the raw PS5 input probe.
+- `debug/ps5_scene_debug.py` maps PS5 input onto a simple scene marker before touching the robot.
 
 ## YCB Assets
 
