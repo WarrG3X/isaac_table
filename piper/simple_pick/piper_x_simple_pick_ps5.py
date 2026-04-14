@@ -3,7 +3,9 @@ from isaacsim import SimulationApp
 simulation_app = SimulationApp({"headless": False})
 
 import argparse
+import json
 import os
+import time
 
 import numpy as np
 import omni.kit.commands
@@ -17,6 +19,7 @@ from isaacsim.core.utils.stage import add_reference_to_stage
 from isaacsim.core.utils.types import ArticulationAction
 from isaacsim.core.utils.viewports import set_camera_view
 from isaacsim.robot_motion.motion_generation import ArticulationKinematicsSolver, LulaKinematicsSolver
+from PIL import Image
 from isaacsim.sensors.camera import Camera
 from pxr import Gf, Sdf, UsdGeom, UsdLux, UsdShade, Vt
 
@@ -29,6 +32,7 @@ DEFAULT_LULA_YAML = os.path.join(REPO_ROOT, "desc", "piper_x_robot_description.y
 DEFAULT_LULA_URDF = os.path.join(
     ISAAC_ROOT, "piper_isaac_sim", "piper_x_description", "urdf", "piper_x_description_d435.urdf"
 )
+DEFAULT_DATA_DIR = os.path.join(REPO_ROOT, "data", "simple_pick_raw")
 
 
 def define_box(stage, prim_path, size, translate):
@@ -161,12 +165,77 @@ def build_camera_window(title, provider, width, height, pos_x, pos_y):
 
 def update_camera_provider(camera, provider):
     rgba = np.asarray(camera.get_rgba(device="cpu"), dtype=np.uint8)
+    update_camera_provider_from_rgba(provider, rgba)
+
+
+def update_camera_provider_from_rgba(provider, rgba):
     if rgba.ndim != 3 or rgba.shape[0] == 0 or rgba.shape[1] == 0:
         return
     if rgba.shape[2] == 3:
         alpha = np.full((rgba.shape[0], rgba.shape[1], 1), 255, dtype=np.uint8)
         rgba = np.concatenate([rgba, alpha], axis=2)
     provider.set_bytes_data(bytearray(rgba.tobytes()), [int(rgba.shape[1]), int(rgba.shape[0])])
+
+
+def create_episode_buffer():
+    return {
+        "started_at": time.time(),
+        "steps": [],
+        "top_rgb": [],
+        "wrist_rgb": [],
+        "success": False,
+    }
+
+
+def save_episode(output_dir, episode, task_name, source_pad_center, target_pad_center, cube_start, ee_frame):
+    os.makedirs(output_dir, exist_ok=True)
+    episode_id = time.strftime("episode_%Y%m%d_%H%M%S")
+    episode_dir = os.path.join(output_dir, episode_id)
+    suffix = 0
+    while os.path.exists(episode_dir):
+        suffix += 1
+        episode_dir = os.path.join(output_dir, f"{episode_id}_{suffix:02d}")
+    os.makedirs(episode_dir, exist_ok=False)
+    top_dir = os.path.join(episode_dir, "images", "top")
+    wrist_dir = os.path.join(episode_dir, "images", "wrist")
+    os.makedirs(top_dir, exist_ok=True)
+    os.makedirs(wrist_dir, exist_ok=True)
+
+    for idx, rgb in enumerate(episode["top_rgb"]):
+        Image.fromarray(rgb).save(os.path.join(top_dir, f"{idx:06d}.png"))
+    for idx, rgb in enumerate(episode["wrist_rgb"]):
+        Image.fromarray(rgb).save(os.path.join(wrist_dir, f"{idx:06d}.png"))
+
+    np.savez_compressed(
+        os.path.join(episode_dir, "data.npz"),
+        step_index=np.asarray([step["step_index"] for step in episode["steps"]], dtype=np.int32),
+        timestamp=np.asarray([step["timestamp"] for step in episode["steps"]], dtype=np.float64),
+        joint_position=np.asarray([step["joint_position"] for step in episode["steps"]], dtype=np.float32),
+        ee_position=np.asarray([step["ee_position"] for step in episode["steps"]], dtype=np.float32),
+        ee_delta=np.asarray([step["ee_delta"] for step in episode["steps"]], dtype=np.float32),
+        gripper_action=np.asarray([step["gripper_action"] for step in episode["steps"]], dtype=np.int8),
+        gripper_open=np.asarray([step["gripper_open"] for step in episode["steps"]], dtype=np.int8),
+    )
+
+    metadata = {
+        "format": "simple_pick_raw_v1",
+        "task": task_name,
+        "controller": "ps5",
+        "ee_frame": ee_frame,
+        "success": bool(episode["success"]),
+        "num_steps": len(episode["steps"]),
+        "source_pad_center": list(source_pad_center),
+        "target_pad_center": list(target_pad_center),
+        "cube_start_position": list(cube_start),
+        "images": {
+            "top": "images/top",
+            "wrist": "images/wrist",
+        },
+        "data_file": "data.npz",
+    }
+    with open(os.path.join(episode_dir, "metadata.json"), "w", encoding="utf-8") as f:
+        json.dump(metadata, f, indent=2)
+    return episode_dir
 
 
 def quat_multiply_wxyz(q1, q2):
@@ -260,6 +329,7 @@ parser.add_argument("--ee-frame", type=str, default="Link6")
 parser.add_argument("--table-width", type=float, default=1.40)
 parser.add_argument("--table-depth", type=float, default=1.55)
 parser.add_argument("--cube-size", type=float, default=0.05)
+parser.add_argument("--data-dir", type=str, default=DEFAULT_DATA_DIR)
 args, _ = parser.parse_known_args()
 
 world = World(stage_units_in_meters=1.0)
@@ -452,12 +522,15 @@ joystick = init_controller(args.controller)
 last_buttons = []
 gripper_open = True
 success_latched = False
+recording = False
+episode = None
+episode_step_index = 0
 print("[PS5] controls:")
 print("[PS5] left stick -> X/Y")
 print("[PS5] triggers -> Z down/up")
 print("[PS5] right stick -> roll/pitch")
 print("[PS5] L1/R1 -> yaw -/+")
-print("[PS5] Cross -> gripper toggle | Circle -> reset target")
+print("[PS5] Cross -> gripper toggle | Circle -> reset/discard | Square -> start/stop recording")
 
 try:
     while simulation_app.is_running():
@@ -520,10 +593,36 @@ try:
         set_translate(target_marker.GetPrim(), target_position)
         status_model.set_value(f"({target_position[0]:.3f}, {target_position[1]:.3f}, {target_position[2]:.3f})")
 
+        gripper_action = 0
         if 0 in buttons and 0 not in last_buttons:
             gripper_open = not gripper_open
+            gripper_action = 1 if gripper_open else -1
             print(f"[PS5] gripper toggled -> {'open' if gripper_open else 'closed'}")
+        if 2 in buttons and 2 not in last_buttons:
+            if not recording:
+                episode = create_episode_buffer()
+                episode_step_index = 0
+                recording = True
+                print("[PS5] recording started")
+            else:
+                recording = False
+                episode["success"] = bool(episode["success"] or success_latched)
+                episode_dir = save_episode(
+                    output_dir=os.path.abspath(args.data_dir),
+                    episode=episode,
+                    task_name="simple_pick_red_to_blue",
+                    source_pad_center=source_pad_center,
+                    target_pad_center=target_pad_center,
+                    cube_start=initial_cube_position,
+                    ee_frame=args.ee_frame,
+                )
+                print(f"[PS5] recording stopped -> saved {episode_dir}")
+                episode = None
         if 1 in buttons and 1 not in last_buttons:
+            if recording:
+                recording = False
+                episode = None
+                print("[PS5] recording discarded")
             target_position = initial_target_position.copy()
             target_orientation = initial_target_orientation.copy()
             cube.set_world_pose(position=initial_cube_position, orientation=initial_cube_orientation)
@@ -582,6 +681,8 @@ try:
         if in_target and not success_latched:
             print(f"[SimplePick] success: cube entered target square at {cube_pos}")
             success_latched = True
+            if recording and episode is not None:
+                episode["success"] = True
         elif not in_target:
             success_latched = False
 
@@ -593,8 +694,30 @@ try:
             last_buttons = buttons
 
         world.step(render=True)
-        update_camera_provider(topdown_sensor_camera, topdown_provider)
-        update_camera_provider(robot_sensor_camera, robot_provider)
+        top_rgba = np.asarray(topdown_sensor_camera.get_rgba(device="cpu"), dtype=np.uint8)
+        wrist_rgba = np.asarray(robot_sensor_camera.get_rgba(device="cpu"), dtype=np.uint8)
+        if top_rgba.ndim == 3:
+            update_camera_provider_from_rgba(topdown_provider, top_rgba)
+        if wrist_rgba.ndim == 3:
+            update_camera_provider_from_rgba(robot_provider, wrist_rgba)
+        if recording and episode is not None and top_rgba.ndim == 3 and wrist_rgba.ndim == 3:
+            episode["top_rgb"].append(top_rgba[:, :, :3].copy())
+            episode["wrist_rgb"].append(wrist_rgba[:, :, :3].copy())
+            episode["steps"].append(
+                {
+                    "step_index": episode_step_index,
+                    "timestamp": time.time(),
+                    "joint_position": np.asarray(robot.get_joint_positions(), dtype=np.float32).copy(),
+                    "ee_position": np.asarray(ee_world_position, dtype=np.float32).copy(),
+                    "ee_delta": np.array(
+                        [delta[0], delta[1], delta[2], rot_delta[0], rot_delta[1], rot_delta[2]],
+                        dtype=np.float32,
+                    ),
+                    "gripper_action": gripper_action,
+                    "gripper_open": 1 if gripper_open else 0,
+                }
+            )
+            episode_step_index += 1
 finally:
     joystick.quit()
     pygame.joystick.quit()
