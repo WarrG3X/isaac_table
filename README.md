@@ -26,7 +26,7 @@ Known-good current state:
 - RGB, depth, and custom instance segmentation capture are working.
 - YCB object dropping works from the local Isaac `Materials & Props` asset pack.
 - `piper/bin_pick/piper_x_scene.py` loads one Piper X onto the table from the shipped AgileX USD.
-- `piper/simple_pick/piper_x_simple_pick_ps5.py` provides PS5 teleop for the simple pick/place POC.
+- `piper/simple_pick/piper_x_simple_pick_ps5.py` provides PS5 teleop, dual camera feeds, and raw episode recording for the simple pick/place POC.
 
 Known caveats:
 
@@ -105,11 +105,18 @@ Run the simple pick/place PS5 teleop scene:
 .\python.bat standalone_examples\user\isaac_table\piper\simple_pick\piper_x_simple_pick_ps5.py
 ```
 
+Run the same scene with live top-down and wrist camera panels:
+
+```powershell
+.\python.bat standalone_examples\user\isaac_table\piper\simple_pick\piper_x_simple_pick_ps5.py --camera-panels
+```
+
 Useful Piper options:
 
 ```powershell
 .\python.bat standalone_examples\user\isaac_table\piper\bin_pick\piper_x_scene.py --robot-y 0.18
 .\python.bat standalone_examples\user\isaac_table\piper\simple_pick\piper_x_simple_pick_ps5.py --translation-scale 0.0018
+.\python.bat standalone_examples\user\isaac_table\piper\simple_pick\piper_x_simple_pick_ps5.py --camera-panels --image-format jpg --jpeg-quality 80
 ```
 
 Notes:
@@ -117,6 +124,9 @@ Notes:
 - The scene uses the shipped `piper_x_v1.usd`, not a fresh URDF import.
 - This is intentional on Windows because the cloned repo has mesh filename case collisions such as `base_Link.dae` vs `base_link.dae`.
 - Lula is configured arm-only for IK. Gripper control is handled separately.
+- The simple-pick PS5 scene records raw episodes to `data/simple_pick_raw/`.
+- `Cross` toggles the gripper, `Circle` resets/discards the current attempt, and `Square` starts or stops recording.
+- Camera panels are optional. Recording still captures the top-down and wrist camera feeds when `--camera-panels` is omitted.
 
 ## Robot Debug
 
