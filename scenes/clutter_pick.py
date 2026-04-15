@@ -4,6 +4,7 @@ import numpy as np
 from isaacsim.core.prims import SingleRigidPrim
 from isaacsim.core.utils.stage import add_reference_to_stage
 from isaacsim.core.utils.viewports import set_camera_view
+from isaacsim.storage.native import get_assets_root_path
 from pxr import Gf, Sdf, UsdGeom, UsdLux
 
 from .common import SceneInfo, add_robot, apply_static_collision, auto_generate_convex_colliders, bind_material, build_tabletop_with_cutouts, build_tray, compute_bbox_range, compute_bbox_volume, create_omnipbr_material, create_robot_camera, create_topdown_camera, define_box, define_uv_plane, list_ycb_assets, offset_prim_translate_z
@@ -11,6 +12,18 @@ from .common import SceneInfo, add_robot, apply_static_collision, auto_generate_
 
 ASSET_ROOT = r"C:\Users\Warra\Downloads\Assets\Isaac\5.1"
 YCB_AXIS_ALIGNED_DIR = os.path.join(ASSET_ROOT, "Isaac", "Props", "YCB", "Axis_Aligned")
+
+
+def get_floor_top_z(stage, prim_path):
+    prim = stage.GetPrimAtPath(prim_path)
+    if not prim.IsValid():
+        return None
+    bbox_cache = UsdGeom.BBoxCache(0, [UsdGeom.Tokens.default_])
+    bbox = bbox_cache.ComputeWorldBound(prim)
+    rng = bbox.GetRange()
+    if rng.IsEmpty():
+        return None
+    return float(rng.GetMax()[2])
 
 
 def default_scene_config(repo_root, robot_usd, ee_frame, robot_x, robot_y, robot_yaw, table_width, table_depth, tray_width, tray_depth, tray_height, tray_wall, num_objects, seed, max_volume):
@@ -24,6 +37,12 @@ def default_scene_config(repo_root, robot_usd, ee_frame, robot_x, robot_y, robot
         "trays": {"width": float(tray_width), "depth": float(tray_depth), "height": float(tray_height), "wall": float(tray_wall), "source_center": [-0.38, 0.178], "target_center": [0.38, 0.178]},
         "objects": {"seed": int(seed), "max_volume": float(max_volume), "num_objects": int(num_objects), "asset_root": YCB_AXIS_ALIGNED_DIR, "spawned": []},
         "cameras": {"task_center": [0.0, 0.178, table_surface_z], "task_coverage_xy": [abs(0.38 - (-0.38)) + tray_width + 0.24, tray_depth + 0.28], "main_view_eye": [0.0, 2.15, 1.55], "main_view_target": [0.0, 0.20, 0.82]},
+        "environment": {
+            "name": "simple_room",
+            "room_prim_path": "/World/Room",
+            "deactivate_table_prim": "/World/Room/table_low_327",
+            "floor_support_prim": "/World/Room/Towel_Room01_floor_bottom_218",
+        },
         "task": {"name": "clutter_pick_source_to_target"},
         "repo_root": os.path.abspath(repo_root),
     }
@@ -67,6 +86,21 @@ def build_scene(world, stage, config):
     for path in ["/World", "/World/Looks", "/World/Floor", "/World/Table", "/World/SourceTray", "/World/TargetTray", "/World/Clutter", "/World/Lights", "/World/RobotMount", "/World/Debug"]:
         UsdGeom.Xform.Define(stage, path)
 
+    environment_cfg = config.get("environment", {})
+    if environment_cfg.get("name") == "simple_room":
+        assets_root_path = get_assets_root_path()
+        if assets_root_path is None:
+            raise RuntimeError("Could not find Isaac Sim assets folder for Simple_Room")
+        add_reference_to_stage(
+            usd_path=assets_root_path + "/Isaac/Environments/Simple_Room/simple_room.usd",
+            prim_path=environment_cfg.get("room_prim_path", "/World/Room"),
+        )
+        room_table_path = environment_cfg.get("deactivate_table_prim")
+        if room_table_path:
+            room_table = stage.GetPrimAtPath(room_table_path)
+            if room_table.IsValid():
+                room_table.SetActive(False)
+
     bamboo_texture_path = os.path.join(repo_root, "materials", "nv_bamboo_desktop.jpg")
     granite_texture_path = os.path.join(repo_root, "materials", "nv_granite_tile.jpg")
     floor_material_base = create_omnipbr_material(stage, "/World/Looks/FloorBase", color=(0.44, 0.46, 0.48), roughness=0.72)
@@ -87,12 +121,19 @@ def build_scene(world, stage, config):
     cameras_cfg = config["cameras"]
     table_size = (float(table_cfg["width"]), float(table_cfg["depth"]), float(table_cfg["thickness"]))
     table_top_z = float(table_cfg["top_z"])
-    table_surface_z = table_top_z + table_size[2] * 0.5
     leg_height = float(table_cfg["leg_height"])
     leg_dx = table_size[0] * 0.5 - 0.08
     leg_dy = table_size[1] * 0.5 - 0.08
+    leg_center_z = leg_height * 0.5
+    floor_support_prim = environment_cfg.get("floor_support_prim")
+    if environment_cfg.get("name") == "simple_room" and floor_support_prim:
+        floor_top_z = get_floor_top_z(stage, floor_support_prim)
+        if floor_top_z is not None:
+            leg_center_z = floor_top_z + leg_height * 0.5
+            table_top_z = floor_top_z + leg_height + table_size[2] * 0.5
+    table_surface_z = table_top_z + table_size[2] * 0.5
     table_leg_paths = []
-    for name, position in {"LegFL": (leg_dx, leg_dy, leg_height * 0.5), "LegFR": (leg_dx, -leg_dy, leg_height * 0.5), "LegBL": (-leg_dx, leg_dy, leg_height * 0.5), "LegBR": (-leg_dx, -leg_dy, leg_height * 0.5)}.items():
+    for name, position in {"LegFL": (leg_dx, leg_dy, leg_center_z), "LegFR": (leg_dx, -leg_dy, leg_center_z), "LegBL": (-leg_dx, leg_dy, leg_center_z), "LegBR": (-leg_dx, -leg_dy, leg_center_z)}.items():
         leg_prim = define_box(stage, f"/World/Table/{name}", size=(0.06, 0.06, leg_height), translate=position)
         bind_material(leg_prim, leg_material)
         table_leg_paths.append(str(leg_prim.GetPath()))
@@ -125,7 +166,8 @@ def build_scene(world, stage, config):
     robot_cfg = config["robot"]
     robot = add_robot(stage, robot_cfg["usd_path"], robot_cfg["x"], robot_cfg["y"], robot_cfg["yaw_deg"], table_surface_z)
     robot_camera_prim = create_robot_camera(stage, "/World/RobotMount/PiperX/Robot/piper_x_camera/camera_link/DebugCamera")
-    topdown_camera_prim = create_topdown_camera(stage, "/World/Debug/TopDownCamera", center=cameras_cfg["task_center"], coverage_xy=cameras_cfg["task_coverage_xy"])
+    task_center = (float(cameras_cfg["task_center"][0]), float(cameras_cfg["task_center"][1]), table_surface_z)
+    topdown_camera_prim = create_topdown_camera(stage, "/World/Debug/TopDownCamera", center=task_center, coverage_xy=cameras_cfg["task_coverage_xy"])
 
     clutter_objects = []
     object_info = []
@@ -138,4 +180,9 @@ def build_scene(world, stage, config):
         object_info.append({"name": entry["name"], "usd_path": entry["usd_path"], "initial_position": list(entry["initial_position"]), "initial_orientation_wxyz": list(entry["initial_orientation_wxyz"]), "bbox_size": list(entry["bbox_size"])})
 
     set_camera_view(eye=cameras_cfg["main_view_eye"], target=cameras_cfg["main_view_target"], camera_prim_path="/OmniverseKit_Persp")
-    return SceneInfo(scene_name="clutter_pick", robot=robot, robot_prim_path="/World/RobotMount/PiperX/Robot", robot_camera_prim_path=str(robot_camera_prim.GetPath()), topdown_camera_prim_path=str(topdown_camera_prim.GetPath()), table_surface_z=table_surface_z, task_center=tuple(float(v) for v in cameras_cfg["task_center"]), task_coverage_xy=tuple(float(v) for v in cameras_cfg["task_coverage_xy"]), scene_config=config, extras={"source_tray_center": source_tray_center, "target_tray_center": target_tray_center, "clutter_objects": clutter_objects, "object_info": object_info, "tray_width": float(tray_cfg["width"]), "tray_depth": float(tray_cfg["depth"])})
+    if environment_cfg.get("name") == "simple_room":
+        for prim_path in ["/World/Floor/Base", "/World/Floor/Surface", "/World/Lights/Dome", "/World/Lights/Sun"]:
+            prim = stage.GetPrimAtPath(prim_path)
+            if prim.IsValid():
+                prim.SetActive(False)
+    return SceneInfo(scene_name="clutter_pick", robot=robot, robot_prim_path="/World/RobotMount/PiperX/Robot", robot_camera_prim_path=str(robot_camera_prim.GetPath()), topdown_camera_prim_path=str(topdown_camera_prim.GetPath()), table_surface_z=table_surface_z, task_center=task_center, task_coverage_xy=tuple(float(v) for v in cameras_cfg["task_coverage_xy"]), scene_config=config, extras={"source_tray_center": source_tray_center, "target_tray_center": target_tray_center, "clutter_objects": clutter_objects, "object_info": object_info, "tray_width": float(tray_cfg["width"]), "tray_depth": float(tray_cfg["depth"])})

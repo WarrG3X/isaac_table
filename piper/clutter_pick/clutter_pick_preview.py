@@ -11,6 +11,7 @@ from isaacsim.core.api import World
 from isaacsim.core.prims import GeometryPrim, SingleRigidPrim
 from isaacsim.core.utils.stage import add_reference_to_stage
 from isaacsim.core.utils.viewports import set_camera_view
+from isaacsim.storage.native import get_assets_root_path
 from pxr import Gf, Sdf, Usd, UsdGeom, UsdLux, UsdShade, UsdPhysics, Vt
 
 
@@ -120,6 +121,18 @@ def offset_prim_translate_z(stage, prim_path, delta_z):
         return
     current = translate_ops[0].Get()
     translate_ops[0].Set(Gf.Vec3d(float(current[0]), float(current[1]), float(current[2] + delta_z)))
+
+
+def get_floor_top_z(stage, prim_path):
+    prim = stage.GetPrimAtPath(prim_path)
+    if not prim.IsValid():
+        return None
+    bbox_cache = UsdGeom.BBoxCache(0, [UsdGeom.Tokens.default_])
+    bbox = bbox_cache.ComputeWorldBound(prim)
+    rng = bbox.GetRange()
+    if rng.IsEmpty():
+        return None
+    return float(rng.GetMax()[2])
 
 
 def list_ycb_assets():
@@ -293,6 +306,17 @@ UsdGeom.Xform.Define(stage, "/World/TargetTray")
 UsdGeom.Xform.Define(stage, "/World/Clutter")
 UsdGeom.Xform.Define(stage, "/World/Lights")
 
+assets_root_path = get_assets_root_path()
+if assets_root_path is None:
+    raise RuntimeError("Could not find Isaac Sim assets folder for Simple_Room")
+add_reference_to_stage(
+    usd_path=assets_root_path + "/Isaac/Environments/Simple_Room/simple_room.usd",
+    prim_path="/World/Room",
+)
+room_table = stage.GetPrimAtPath("/World/Room/table_low_327")
+if room_table.IsValid():
+    room_table.SetActive(False)
+
 bamboo_texture_path = os.path.join(REPO_ROOT, "materials", "nv_bamboo_desktop.jpg")
 granite_texture_path = os.path.join(REPO_ROOT, "materials", "nv_granite_tile.jpg")
 
@@ -323,17 +347,22 @@ bind_material(floor_surface, floor_material)
 
 table_size = (args.table_width, args.table_depth, 0.06)
 table_top_z = 0.75
-table_surface_z = table_top_z + table_size[2] * 0.5
 
 leg_height = 0.72
 leg_dx = table_size[0] * 0.5 - 0.08
 leg_dy = table_size[1] * 0.5 - 0.08
+leg_center_z = leg_height * 0.5
+floor_top_z = get_floor_top_z(stage, "/World/Room/Towel_Room01_floor_bottom_218")
+if floor_top_z is not None:
+    leg_center_z = floor_top_z + leg_height * 0.5
+    table_top_z = floor_top_z + leg_height + table_size[2] * 0.5
+table_surface_z = table_top_z + table_size[2] * 0.5
 table_collision_paths = [str(floor_prim.GetPath())]
 for name, position in {
-    "LegFL": (leg_dx, leg_dy, leg_height * 0.5),
-    "LegFR": (leg_dx, -leg_dy, leg_height * 0.5),
-    "LegBL": (-leg_dx, leg_dy, leg_height * 0.5),
-    "LegBR": (-leg_dx, -leg_dy, leg_height * 0.5),
+    "LegFL": (leg_dx, leg_dy, leg_center_z),
+    "LegFR": (leg_dx, -leg_dy, leg_center_z),
+    "LegBL": (-leg_dx, leg_dy, leg_center_z),
+    "LegBR": (-leg_dx, -leg_dy, leg_center_z),
 }.items():
     leg_prim = define_box(stage, f"/World/Table/{name}", size=(0.06, 0.06, leg_height), translate=position)
     bind_material(leg_prim, leg_material)
@@ -457,6 +486,11 @@ print(f"[ClutterPickPreview] ycb bank size after volume filter < {args.max_volum
 print("[ClutterPickPreview] spawned SKUs:")
 for _, sku_name in spawned:
     print(f"  - {sku_name}")
+
+for prim_path in ["/World/Floor/Base", "/World/Floor/Surface", "/World/Lights/Dome", "/World/Lights/Sun"]:
+    prim = stage.GetPrimAtPath(prim_path)
+    if prim.IsValid():
+        prim.SetActive(False)
 
 while simulation_app.is_running():
     world.step(render=True)

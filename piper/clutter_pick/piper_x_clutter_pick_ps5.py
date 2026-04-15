@@ -21,6 +21,7 @@ from isaacsim.core.utils.stage import add_reference_to_stage
 from isaacsim.core.utils.types import ArticulationAction
 from isaacsim.core.utils.viewports import set_camera_view
 from isaacsim.robot_motion.motion_generation import ArticulationKinematicsSolver, LulaKinematicsSolver
+from isaacsim.storage.native import get_assets_root_path
 from PIL import Image
 from isaacsim.sensors.camera import Camera
 from pxr import Gf, Sdf, Usd, UsdGeom, UsdLux, UsdShade, UsdPhysics, Vt
@@ -278,6 +279,18 @@ def offset_prim_translate_z(stage, prim_path, delta_z):
     translate_ops[0].Set(Gf.Vec3d(float(current[0]), float(current[1]), float(current[2] + delta_z)))
 
 
+def get_floor_top_z(stage, prim_path):
+    prim = stage.GetPrimAtPath(prim_path)
+    if not prim.IsValid():
+        return None
+    bbox_cache = UsdGeom.BBoxCache(0, [UsdGeom.Tokens.default_])
+    bbox = bbox_cache.ComputeWorldBound(prim)
+    rng = bbox.GetRange()
+    if rng.IsEmpty():
+        return None
+    return float(rng.GetMax()[2])
+
+
 def create_robot_camera(stage, prim_path):
     mount = UsdGeom.Xform.Define(stage, prim_path)
     mount_xform = UsdGeom.Xformable(mount.GetPrim())
@@ -362,6 +375,8 @@ def create_episode_buffer():
         "top_rgb": [],
         "wrist_rgb": [],
         "success": False,
+        "object_position": [],
+        "object_orientation_wxyz": [],
     }
 
 
@@ -402,6 +417,8 @@ def save_episode(output_dir, episode, task_name, source_tray_center, target_tray
         ee_delta=np.asarray([step["ee_delta"] for step in episode["steps"]], dtype=np.float32),
         gripper_action=np.asarray([step["gripper_action"] for step in episode["steps"]], dtype=np.int8),
         gripper_open=np.asarray([step["gripper_open"] for step in episode["steps"]], dtype=np.int8),
+        object_position=np.asarray(episode["object_position"], dtype=np.float32),
+        object_orientation_wxyz=np.asarray(episode["object_orientation_wxyz"], dtype=np.float32),
     )
 
     metadata = {
@@ -422,6 +439,7 @@ def save_episode(output_dir, episode, task_name, source_tray_center, target_tray
         "image_format": image_ext,
         "data_file": "data.npz",
         "scene_file": "scene.yaml",
+        "playback_mode_default": "full_state",
     }
     with open(os.path.join(episode_dir, "metadata.json"), "w", encoding="utf-8") as f:
         json.dump(metadata, f, indent=2)
@@ -564,6 +582,17 @@ UsdGeom.Xform.Define(stage, "/World/Lights")
 UsdGeom.Xform.Define(stage, "/World/RobotMount")
 UsdGeom.Xform.Define(stage, "/World/Debug")
 
+assets_root_path = get_assets_root_path()
+if assets_root_path is None:
+    raise RuntimeError("Could not find Isaac Sim assets folder for Simple_Room")
+add_reference_to_stage(
+    usd_path=assets_root_path + "/Isaac/Environments/Simple_Room/simple_room.usd",
+    prim_path="/World/Room",
+)
+room_table = stage.GetPrimAtPath("/World/Room/table_low_327")
+if room_table.IsValid():
+    room_table.SetActive(False)
+
 bamboo_texture_path = os.path.join(REPO_ROOT, "materials", "nv_bamboo_desktop.jpg")
 granite_texture_path = os.path.join(REPO_ROOT, "materials", "nv_granite_tile.jpg")
 
@@ -583,17 +612,22 @@ bind_material(floor_surface_prim, floor_material)
 
 table_size = (args.table_width, args.table_depth, 0.06)
 table_top_z = 0.75
-table_surface_z = table_top_z + table_size[2] * 0.5
 
 leg_height = 0.72
 leg_dx = table_size[0] * 0.5 - 0.08
 leg_dy = table_size[1] * 0.5 - 0.08
+leg_center_z = leg_height * 0.5
+floor_top_z = get_floor_top_z(stage, "/World/Room/Towel_Room01_floor_bottom_218")
+if floor_top_z is not None:
+    leg_center_z = floor_top_z + leg_height * 0.5
+    table_top_z = floor_top_z + leg_height + table_size[2] * 0.5
+table_surface_z = table_top_z + table_size[2] * 0.5
 table_leg_paths = []
 for name, position in {
-    "LegFL": (leg_dx, leg_dy, leg_height * 0.5),
-    "LegFR": (leg_dx, -leg_dy, leg_height * 0.5),
-    "LegBL": (-leg_dx, leg_dy, leg_height * 0.5),
-    "LegBR": (-leg_dx, -leg_dy, leg_height * 0.5),
+    "LegFL": (leg_dx, leg_dy, leg_center_z),
+    "LegFR": (leg_dx, -leg_dy, leg_center_z),
+    "LegBL": (-leg_dx, leg_dy, leg_center_z),
+    "LegBR": (-leg_dx, -leg_dy, leg_center_z),
 }.items():
     leg_prim = define_box(stage, f"/World/Table/{name}", size=(0.06, 0.06, leg_height), translate=position)
     bind_material(leg_prim, leg_material)
@@ -770,6 +804,11 @@ if args.camera_panels:
     print(f"[ClutterPick] wrist camera panel: {robot_window.title}")
 for entry in clutter_objects:
     print(f"  - {entry['name']}")
+
+for prim_path in ["/World/Floor/Base", "/World/Floor/Surface", "/World/Lights/Dome", "/World/Lights/Sun"]:
+    prim = stage.GetPrimAtPath(prim_path)
+    if prim.IsValid():
+        prim.SetActive(False)
 
 stiffnesses = np.asarray(dof_props["stiffness"], dtype=np.float32).copy()
 dampings = np.asarray(dof_props["damping"], dtype=np.float32).copy()
@@ -1023,8 +1062,16 @@ try:
         if args.camera_panels and wrist_rgba.ndim == 3:
             update_camera_provider_from_rgba(robot_provider, wrist_rgba)
         if recording and episode is not None and top_rgba.ndim == 3 and wrist_rgba.ndim == 3:
+            object_positions = []
+            object_orientations = []
+            for entry in clutter_objects:
+                obj_position, obj_orientation = entry["rigid"].get_world_pose()
+                object_positions.append(np.asarray(obj_position, dtype=np.float32))
+                object_orientations.append(np.asarray(obj_orientation, dtype=np.float32))
             episode["top_rgb"].append(top_rgba[:, :, :3].copy())
             episode["wrist_rgb"].append(wrist_rgba[:, :, :3].copy())
+            episode["object_position"].append(np.stack(object_positions, axis=0))
+            episode["object_orientation_wxyz"].append(np.stack(object_orientations, axis=0))
             episode["steps"].append(
                 {
                     "step_index": episode_step_index,
