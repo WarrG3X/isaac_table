@@ -1,0 +1,464 @@
+from isaacsim import SimulationApp
+
+simulation_app = SimulationApp({"headless": False})
+
+import argparse
+import os
+
+import numpy as np
+import omni.kit.commands
+from isaacsim.core.api import World
+from isaacsim.core.prims import GeometryPrim, SingleRigidPrim
+from isaacsim.core.utils.stage import add_reference_to_stage
+from isaacsim.core.utils.viewports import set_camera_view
+from pxr import Gf, Sdf, Usd, UsdGeom, UsdLux, UsdShade, UsdPhysics, Vt
+
+
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+REPO_ROOT = os.path.abspath(os.path.join(SCRIPT_DIR, "..", ".."))
+ASSET_ROOT = r"C:\Users\Warra\Downloads\Assets\Isaac\5.1"
+YCB_AXIS_ALIGNED_DIR = os.path.join(ASSET_ROOT, "Isaac", "Props", "YCB", "Axis_Aligned")
+
+
+parser = argparse.ArgumentParser()
+parser.add_argument("--table-width", type=float, default=1.90)
+parser.add_argument("--table-depth", type=float, default=1.55)
+parser.add_argument("--tray-width", type=float, default=0.60)
+parser.add_argument("--tray-depth", type=float, default=0.42)
+parser.add_argument("--tray-height", type=float, default=0.1275)
+parser.add_argument("--tray-wall", type=float, default=0.012)
+parser.add_argument("--num-objects", type=int, default=17)
+parser.add_argument("--seed", type=int, default=42)
+parser.add_argument("--max-volume", type=float, default=0.002)
+args, _ = parser.parse_known_args()
+
+
+def define_box(stage, prim_path, size, translate):
+    root = UsdGeom.Xform.Define(stage, prim_path)
+    root.AddTranslateOp().Set(Gf.Vec3d(*translate))
+    cube = UsdGeom.Cube.Define(stage, f"{prim_path}/Geom")
+    cube.CreateSizeAttr(1.0)
+    UsdGeom.Xformable(cube.GetPrim()).AddScaleOp().Set(Gf.Vec3f(*size))
+    return cube.GetPrim()
+
+
+def define_uv_plane(stage, prim_path, size, translate, uv_scale=(1.0, 1.0)):
+    root = UsdGeom.Xform.Define(stage, prim_path)
+    root.AddTranslateOp().Set(Gf.Vec3d(*translate))
+    root.AddScaleOp().Set(Gf.Vec3f(size[0], size[1], 1.0))
+    mesh = UsdGeom.Mesh.Define(stage, f"{prim_path}/Geom")
+    mesh.CreatePointsAttr(
+        [
+            Gf.Vec3f(-0.5, -0.5, 0.0),
+            Gf.Vec3f(0.5, -0.5, 0.0),
+            Gf.Vec3f(0.5, 0.5, 0.0),
+            Gf.Vec3f(-0.5, 0.5, 0.0),
+        ]
+    )
+    mesh.CreateFaceVertexCountsAttr([4])
+    mesh.CreateFaceVertexIndicesAttr([0, 1, 2, 3])
+    mesh.CreateNormalsAttr([Gf.Vec3f(0.0, 0.0, 1.0)] * 4)
+    mesh.SetNormalsInterpolation(UsdGeom.Tokens.vertex)
+    mesh.CreateExtentAttr([Gf.Vec3f(-0.5, -0.5, 0.0), Gf.Vec3f(0.5, 0.5, 0.0)])
+    primvars_api = UsdGeom.PrimvarsAPI(mesh)
+    st = primvars_api.CreatePrimvar("st", Sdf.ValueTypeNames.TexCoord2fArray, UsdGeom.Tokens.vertex)
+    st.Set(
+        Vt.Vec2fArray(
+            [
+                Gf.Vec2f(0.0, 0.0),
+                Gf.Vec2f(uv_scale[0], 0.0),
+                Gf.Vec2f(uv_scale[0], uv_scale[1]),
+                Gf.Vec2f(0.0, uv_scale[1]),
+            ]
+        )
+    )
+    return mesh.GetPrim()
+
+
+def create_omnipbr_material(stage, material_path, color=None, roughness=0.5, metallic=0.0, texture_path=None):
+    created = []
+    omni.kit.commands.execute(
+        "CreateAndBindMdlMaterialFromLibrary",
+        mdl_name="OmniPBR.mdl",
+        mtl_name="OmniPBR",
+        mtl_created_list=created,
+    )
+    material_prim = stage.GetPrimAtPath(created[0])
+    if created[0] != material_path:
+        omni.kit.commands.execute("MovePrim", path_from=created[0], path_to=material_path)
+        material_prim = stage.GetPrimAtPath(material_path)
+    if color is not None:
+        omni.usd.create_material_input(
+            material_prim, "diffuse_color_constant", Gf.Vec3f(*color), Sdf.ValueTypeNames.Color3f
+        )
+    omni.usd.create_material_input(material_prim, "reflection_roughness_constant", float(roughness), Sdf.ValueTypeNames.Float)
+    omni.usd.create_material_input(material_prim, "metallic_constant", float(metallic), Sdf.ValueTypeNames.Float)
+    if texture_path:
+        omni.usd.create_material_input(material_prim, "diffuse_texture", texture_path, Sdf.ValueTypeNames.Asset)
+    return UsdShade.Material(material_prim)
+
+
+def bind_material(prim, material):
+    UsdShade.MaterialBindingAPI(prim).Bind(material, UsdShade.Tokens.strongerThanDescendants)
+
+
+def apply_static_collision(prim_paths):
+    for prim_path in prim_paths:
+        GeometryPrim(prim_path).apply_collision_apis()
+
+
+def offset_prim_translate_z(stage, prim_path, delta_z):
+    prim = stage.GetPrimAtPath(prim_path)
+    if not prim.IsValid():
+        return
+    target_prim = prim.GetParent()
+    if not target_prim.IsValid():
+        target_prim = prim
+    xformable = UsdGeom.Xformable(target_prim)
+    translate_ops = [op for op in xformable.GetOrderedXformOps() if op.GetOpType() == UsdGeom.XformOp.TypeTranslate]
+    if not translate_ops:
+        return
+    current = translate_ops[0].Get()
+    translate_ops[0].Set(Gf.Vec3d(float(current[0]), float(current[1]), float(current[2] + delta_z)))
+
+
+def list_ycb_assets():
+    entries = [
+        os.path.join(YCB_AXIS_ALIGNED_DIR, name)
+        for name in sorted(os.listdir(YCB_AXIS_ALIGNED_DIR))
+        if name.endswith(".usd") and not name.startswith(".")
+    ]
+    if not entries:
+        raise RuntimeError(f"No YCB USD files found in: {YCB_AXIS_ALIGNED_DIR}")
+    return entries
+
+
+def compute_bbox_volume(usd_path):
+    stage = Usd.Stage.Open(usd_path)
+    if stage is None:
+        return None
+    bbox_cache = UsdGeom.BBoxCache(
+        Usd.TimeCode.Default(),
+        [UsdGeom.Tokens.default_, UsdGeom.Tokens.render, UsdGeom.Tokens.proxy],
+        useExtentsHint=True,
+    )
+    world = Gf.Range3d()
+    found = False
+    for prim in stage.Traverse():
+        if prim.IsA(UsdGeom.Imageable):
+            bbox = bbox_cache.ComputeWorldBound(prim)
+            rng = bbox.ComputeAlignedRange()
+            if not rng.IsEmpty():
+                if not found:
+                    world = Gf.Range3d(rng.GetMin(), rng.GetMax())
+                    found = True
+                else:
+                    world.UnionWith(rng)
+    if not found:
+        return None
+    size = world.GetSize()
+    return float(size[0]) * float(size[1]) * float(size[2])
+
+
+def find_meshes(root_prim):
+    return [prim for prim in Usd.PrimRange(root_prim) if prim.IsA(UsdGeom.Mesh)]
+
+
+def auto_generate_convex_colliders(root_prim):
+    meshes = find_meshes(root_prim)
+    for mesh in meshes:
+        UsdPhysics.CollisionAPI.Apply(mesh)
+        mesh_api = UsdPhysics.MeshCollisionAPI.Apply(mesh)
+        mesh_api.CreateApproximationAttr().Set("convexHull")
+    return meshes
+
+
+def build_tray(stage, root_path, center_xy, surface_z, outer_size, height, wall, material):
+    outer_w, outer_d = outer_size
+    tray_floor_z = surface_z + wall * 0.5
+    tray_center_z = surface_z + height * 0.5
+    inner_w = outer_w - 2.0 * wall
+    inner_d = outer_d - 2.0 * wall
+    parts = {
+        "Base": (
+            (outer_w, outer_d, wall),
+            (center_xy[0], center_xy[1], tray_floor_z),
+        ),
+        "WallL": (
+            (wall, outer_d, height),
+            (center_xy[0] - outer_w * 0.5 + wall * 0.5, center_xy[1], tray_center_z),
+        ),
+        "WallR": (
+            (wall, outer_d, height),
+            (center_xy[0] + outer_w * 0.5 - wall * 0.5, center_xy[1], tray_center_z),
+        ),
+        "WallB": (
+            (inner_w, wall, height),
+            (center_xy[0], center_xy[1] - outer_d * 0.5 + wall * 0.5, tray_center_z),
+        ),
+        "WallF": (
+            (inner_w, wall, height),
+            (center_xy[0], center_xy[1] + outer_d * 0.5 - wall * 0.5, tray_center_z),
+        ),
+    }
+    paths = []
+    for name, (size, translate) in parts.items():
+        prim = define_box(stage, f"{root_path}/{name}", size=size, translate=translate)
+        bind_material(prim, material)
+        paths.append(str(prim.GetPath()))
+    return paths
+
+
+def build_tabletop_with_cutouts(stage, root_path, table_size, table_top_z, hole_specs, base_material, surface_material):
+    table_half_x = table_size[0] * 0.5
+    table_half_y = table_size[1] * 0.5
+    table_surface_z = table_top_z + table_size[2] * 0.5
+    x_breaks = [-table_half_x]
+    for center_x, _, hole_w, _ in hole_specs:
+        x_breaks.extend([center_x - hole_w * 0.5, center_x + hole_w * 0.5])
+    x_breaks.append(table_half_x)
+    x_breaks = sorted(set(round(v, 6) for v in x_breaks))
+
+    box_paths = []
+    for slab_idx in range(len(x_breaks) - 1):
+        x0 = x_breaks[slab_idx]
+        x1 = x_breaks[slab_idx + 1]
+        slab_width = x1 - x0
+        if slab_width <= 1e-6:
+            continue
+
+        active_holes = []
+        for center_x, center_y, hole_w, hole_d in hole_specs:
+            hole_min_x = center_x - hole_w * 0.5
+            hole_max_x = center_x + hole_w * 0.5
+            if x0 >= hole_min_x - 1e-6 and x1 <= hole_max_x + 1e-6:
+                active_holes.append((center_y, hole_d))
+
+        if not active_holes:
+            piece = define_box(
+                stage,
+                f"{root_path}/Top_{slab_idx}",
+                size=(slab_width, table_size[1], table_size[2]),
+                translate=((x0 + x1) * 0.5, 0.0, table_top_z),
+            )
+            bind_material(piece, base_material)
+            top_plane = define_uv_plane(
+                stage,
+                f"{root_path}/TopSurface_{slab_idx}",
+                size=(max(0.0, slab_width - 0.01), max(0.0, table_size[1] - 0.01)),
+                translate=((x0 + x1) * 0.5, 0.0, table_surface_z + 0.001),
+            )
+            bind_material(top_plane, surface_material)
+            box_paths.append(str(piece.GetPath()))
+            continue
+
+        center_y, hole_d = active_holes[0]
+        hole_min_y = center_y - hole_d * 0.5
+        hole_max_y = center_y + hole_d * 0.5
+        y_segments = [
+            ((-table_half_y + hole_min_y) * 0.5, hole_min_y - (-table_half_y)),
+            ((hole_max_y + table_half_y) * 0.5, table_half_y - hole_max_y),
+        ]
+        for seg_idx, (seg_center_y, seg_depth) in enumerate(y_segments):
+            if seg_depth <= 1e-6:
+                continue
+            piece = define_box(
+                stage,
+                f"{root_path}/Top_{slab_idx}_{seg_idx}",
+                size=(slab_width, seg_depth, table_size[2]),
+                translate=((x0 + x1) * 0.5, seg_center_y, table_top_z),
+            )
+            bind_material(piece, base_material)
+            top_plane = define_uv_plane(
+                stage,
+                f"{root_path}/TopSurface_{slab_idx}_{seg_idx}",
+                size=(max(0.0, slab_width - 0.01), max(0.0, seg_depth - 0.01)),
+                translate=((x0 + x1) * 0.5, seg_center_y, table_surface_z + 0.001),
+            )
+            bind_material(top_plane, surface_material)
+            box_paths.append(str(piece.GetPath()))
+
+    return box_paths
+
+
+world = World(stage_units_in_meters=1.0)
+stage = world.stage
+UsdGeom.SetStageUpAxis(stage, UsdGeom.Tokens.z)
+UsdGeom.Xform.Define(stage, "/World")
+UsdGeom.Xform.Define(stage, "/World/Looks")
+UsdGeom.Xform.Define(stage, "/World/Floor")
+UsdGeom.Xform.Define(stage, "/World/Table")
+UsdGeom.Xform.Define(stage, "/World/SourceTray")
+UsdGeom.Xform.Define(stage, "/World/TargetTray")
+UsdGeom.Xform.Define(stage, "/World/Clutter")
+UsdGeom.Xform.Define(stage, "/World/Lights")
+
+bamboo_texture_path = os.path.join(REPO_ROOT, "materials", "nv_bamboo_desktop.jpg")
+granite_texture_path = os.path.join(REPO_ROOT, "materials", "nv_granite_tile.jpg")
+
+floor_material_base = create_omnipbr_material(stage, "/World/Looks/FloorBase", color=(0.44, 0.46, 0.48), roughness=0.72)
+floor_material = create_omnipbr_material(
+    stage,
+    "/World/Looks/Floor",
+    color=(0.85, 0.85, 0.85),
+    roughness=0.62,
+    texture_path=granite_texture_path if os.path.exists(granite_texture_path) else None,
+)
+wood_material = create_omnipbr_material(
+    stage,
+    "/World/Looks/Wood",
+    color=(0.72, 0.66, 0.54),
+    roughness=0.38,
+    texture_path=bamboo_texture_path if os.path.exists(bamboo_texture_path) else None,
+)
+wood_base_material = create_omnipbr_material(stage, "/World/Looks/WoodBase", color=(0.49, 0.35, 0.20), roughness=0.48)
+leg_material = create_omnipbr_material(stage, "/World/Looks/Legs", color=(0.19, 0.12, 0.08), roughness=0.5)
+source_tray_material = create_omnipbr_material(stage, "/World/Looks/SourceTray", color=(0.16, 0.24, 0.44), roughness=0.60, metallic=0.06)
+target_tray_material = create_omnipbr_material(stage, "/World/Looks/TargetTray", color=(0.46, 0.26, 0.16), roughness=0.62, metallic=0.04)
+
+floor_prim = define_box(stage, "/World/Floor/Base", size=(7.0, 7.0, 0.02), translate=(0.0, 0.0, -0.01))
+bind_material(floor_prim, floor_material_base)
+floor_surface = define_uv_plane(stage, "/World/Floor/Surface", size=(6.92, 6.92), translate=(0.0, 0.0, 0.001), uv_scale=(6.0, 6.0))
+bind_material(floor_surface, floor_material)
+
+table_size = (args.table_width, args.table_depth, 0.06)
+table_top_z = 0.75
+table_surface_z = table_top_z + table_size[2] * 0.5
+
+leg_height = 0.72
+leg_dx = table_size[0] * 0.5 - 0.08
+leg_dy = table_size[1] * 0.5 - 0.08
+table_collision_paths = [str(floor_prim.GetPath())]
+for name, position in {
+    "LegFL": (leg_dx, leg_dy, leg_height * 0.5),
+    "LegFR": (leg_dx, -leg_dy, leg_height * 0.5),
+    "LegBL": (-leg_dx, leg_dy, leg_height * 0.5),
+    "LegBR": (-leg_dx, -leg_dy, leg_height * 0.5),
+}.items():
+    leg_prim = define_box(stage, f"/World/Table/{name}", size=(0.06, 0.06, leg_height), translate=position)
+    bind_material(leg_prim, leg_material)
+    table_collision_paths.append(str(leg_prim.GetPath()))
+
+tray_y = 0.22
+source_tray_center = (-0.38, 0.178)
+target_tray_center = (0.38, 0.178)
+source_tray_paths = build_tray(
+    stage,
+    "/World/SourceTray",
+    center_xy=source_tray_center,
+    surface_z=table_surface_z,
+    outer_size=(args.tray_width, args.tray_depth),
+    height=args.tray_height,
+    wall=args.tray_wall,
+    material=source_tray_material,
+)
+target_tray_paths = build_tray(
+    stage,
+    "/World/TargetTray",
+    center_xy=target_tray_center,
+    surface_z=table_surface_z,
+    outer_size=(args.tray_width, args.tray_depth),
+    height=args.tray_height,
+    wall=args.tray_wall,
+    material=target_tray_material,
+)
+
+recess_surface_z = table_surface_z - args.tray_height
+for path in source_tray_paths:
+    offset_prim_translate_z(stage, path, -args.tray_height)
+for path in target_tray_paths:
+    offset_prim_translate_z(stage, path, -args.tray_height)
+
+tabletop_paths = build_tabletop_with_cutouts(
+    stage,
+    "/World/Table",
+    table_size=table_size,
+    table_top_z=table_top_z,
+    hole_specs=[
+        (source_tray_center[0], source_tray_center[1], args.tray_width, args.tray_depth),
+        (target_tray_center[0], target_tray_center[1], args.tray_width, args.tray_depth),
+    ],
+    base_material=wood_base_material,
+    surface_material=wood_material,
+)
+table_collision_paths.extend(tabletop_paths)
+
+apply_static_collision(table_collision_paths + source_tray_paths + target_tray_paths)
+
+dome_light = UsdLux.DomeLight.Define(stage, Sdf.Path("/World/Lights/Dome"))
+dome_light.CreateIntensityAttr(950.0)
+dome_light.CreateColorAttr(Gf.Vec3f(0.92, 0.95, 1.0))
+sun_light = UsdLux.DistantLight.Define(stage, Sdf.Path("/World/Lights/Sun"))
+sun_light.CreateIntensityAttr(3200.0)
+sun_light.CreateAngleAttr(0.6)
+sun_light.CreateColorAttr(Gf.Vec3f(1.0, 0.96, 0.9))
+UsdGeom.Xformable(sun_light.GetPrim()).AddRotateXYZOp().Set(Gf.Vec3f(315.0, 0.0, 35.0))
+table_fill = UsdLux.RectLight.Define(stage, Sdf.Path("/World/Lights/TableFill"))
+table_fill.CreateIntensityAttr(2000.0)
+table_fill.CreateWidthAttr(2.4)
+table_fill.CreateHeightAttr(1.2)
+table_fill.CreateColorAttr(Gf.Vec3f(1.0, 0.98, 0.95))
+UsdGeom.Xformable(table_fill.GetPrim()).AddTranslateOp().Set(Gf.Vec3f(0.3, 0.05, 1.95))
+UsdGeom.Xformable(table_fill.GetPrim()).AddRotateXYZOp().Set(Gf.Vec3f(-90.0, 0.0, 0.0))
+
+set_camera_view(
+    eye=[0.0, 1.90, 1.45],
+    target=[0.0, 0.20, 0.80],
+    camera_prim_path="/OmniverseKit_Persp",
+)
+
+rng = np.random.default_rng(args.seed)
+ycb_assets = [path for path in list_ycb_assets() if (compute_bbox_volume(path) or 0.0) < args.max_volume]
+if not ycb_assets:
+    raise RuntimeError(f"No YCB assets remain after applying max-volume filter {args.max_volume}")
+selected_count = min(args.num_objects, len(ycb_assets))
+selected_indices = rng.choice(len(ycb_assets), size=selected_count, replace=False)
+spawned = []
+inner_half_x = args.tray_width * 0.5 - args.tray_wall - 0.025
+inner_half_y = args.tray_depth * 0.5 - args.tray_wall - 0.025
+drop_base_z = table_surface_z + args.tray_height + 0.08
+
+for local_idx, asset_idx in enumerate(selected_indices):
+    usd_path = ycb_assets[int(asset_idx)]
+    prim_path = f"/World/Clutter/Object_{local_idx}"
+    add_reference_to_stage(usd_path=usd_path, prim_path=prim_path)
+    auto_generate_convex_colliders(stage.GetPrimAtPath(prim_path))
+    x = float(source_tray_center[0] + rng.uniform(-inner_half_x, inner_half_x))
+    y = float(source_tray_center[1] + rng.uniform(-inner_half_y, inner_half_y))
+    z = float(drop_base_z + 0.06 * local_idx)
+    yaw = float(rng.uniform(0.0, 360.0))
+    rigid = world.scene.add(
+        SingleRigidPrim(
+            prim_path=prim_path,
+            name=f"clutter_object_{local_idx}",
+            position=np.array([x, y, z], dtype=np.float32),
+            orientation=np.array(
+                [
+                    np.cos(np.deg2rad(yaw) * 0.5),
+                    0.0,
+                    0.0,
+                    np.sin(np.deg2rad(yaw) * 0.5),
+                ],
+                dtype=np.float32,
+            ),
+        )
+    )
+    spawned.append((rigid, os.path.basename(usd_path)))
+
+world.reset()
+
+print(f"[ClutterPickPreview] source tray center: {source_tray_center}")
+print(f"[ClutterPickPreview] target tray center: {target_tray_center}")
+print(
+    f"[ClutterPickPreview] tray outer size: "
+    f"({args.tray_width:.3f}, {args.tray_depth:.3f}, {args.tray_height:.3f})"
+)
+print(f"[ClutterPickPreview] ycb bank size after volume filter < {args.max_volume}: {len(ycb_assets)}")
+print("[ClutterPickPreview] spawned SKUs:")
+for _, sku_name in spawned:
+    print(f"  - {sku_name}")
+
+while simulation_app.is_running():
+    world.step(render=True)
+
+simulation_app.close()
