@@ -4,8 +4,10 @@ simulation_app = SimulationApp({"headless": False})
 
 import argparse
 import concurrent.futures
+import copy
 import json
 import os
+import sys
 import time
 
 import numpy as np
@@ -23,17 +25,21 @@ from isaacsim.robot_motion.motion_generation import ArticulationKinematicsSolver
 from PIL import Image
 from isaacsim.sensors.camera import Camera
 from pxr import Gf, Sdf, UsdGeom, UsdLux, UsdShade, Vt
+import yaml
 
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 REPO_ROOT = os.path.abspath(os.path.join(SCRIPT_DIR, "..", ".."))
 ISAAC_ROOT = os.path.abspath(os.path.join(REPO_ROOT, "..", "..", ".."))
+if REPO_ROOT not in sys.path:
+    sys.path.insert(0, REPO_ROOT)
 DEFAULT_PIPER_USD = os.path.join(ISAAC_ROOT, "piper_isaac_sim", "USD", "piper_x_v1.usd")
 DEFAULT_LULA_YAML = os.path.join(REPO_ROOT, "desc", "piper_x_robot_description.yaml")
 DEFAULT_LULA_URDF = os.path.join(
     ISAAC_ROOT, "piper_isaac_sim", "piper_x_description", "urdf", "piper_x_description_d435.urdf"
 )
 DEFAULT_DATA_DIR = os.path.join(REPO_ROOT, "data", "simple_pick_raw")
+from scenes.simple_pick import default_scene_config
 
 
 def define_box(stage, prim_path, size, translate):
@@ -140,6 +146,7 @@ def create_topdown_camera(stage, prim_path, center, coverage_xy):
 
 def build_status_window(initial_position):
     text_model = ui.SimpleStringModel("")
+    save_model = ui.SimpleStringModel("idle")
     window = ui.Window("Simple Pick Teleop", width=460, height=140, visible=True)
     window.position_x = 40
     window.position_y = 60
@@ -150,8 +157,11 @@ def build_status_window(initial_position):
             with ui.HStack(height=24):
                 ui.Label("Target", width=50)
                 ui.StringField(model=text_model, read_only=True)
+            with ui.HStack(height=24):
+                ui.Label("Saves", width=50)
+                ui.StringField(model=save_model, read_only=True)
     text_model.set_value(f"({initial_position[0]:.3f}, {initial_position[1]:.3f}, {initial_position[2]:.3f})")
-    return window, text_model
+    return window, text_model, save_model
 
 
 def build_camera_window(title, provider, width, height, pos_x, pos_y):
@@ -196,7 +206,7 @@ def save_rgb_frame(rgb, path, image_format, jpeg_quality):
         image.save(path, format="PNG")
 
 
-def save_episode(output_dir, episode, task_name, source_pad_center, target_pad_center, cube_start, ee_frame, image_format, jpeg_quality):
+def save_episode(output_dir, episode, task_name, source_pad_center, target_pad_center, cube_start, ee_frame, image_format, jpeg_quality, scene_config):
     os.makedirs(output_dir, exist_ok=True)
     episode_id = time.strftime("episode_%Y%m%d_%H%M%S")
     episode_dir = os.path.join(output_dir, episode_id)
@@ -232,6 +242,7 @@ def save_episode(output_dir, episode, task_name, source_pad_center, target_pad_c
         "task": task_name,
         "controller": "ps5",
         "ee_frame": ee_frame,
+        "scene_name": scene_config["scene_name"],
         "success": bool(episode["success"]),
         "num_steps": len(episode["steps"]),
         "source_pad_center": list(source_pad_center),
@@ -243,9 +254,12 @@ def save_episode(output_dir, episode, task_name, source_pad_center, target_pad_c
         },
         "image_format": image_ext,
         "data_file": "data.npz",
+        "scene_file": "scene.yaml",
     }
     with open(os.path.join(episode_dir, "metadata.json"), "w", encoding="utf-8") as f:
         json.dump(metadata, f, indent=2)
+    with open(os.path.join(episode_dir, "scene.yaml"), "w", encoding="utf-8") as f:
+        yaml.safe_dump(scene_config, f, sort_keys=False)
     return episode_dir
 
 
@@ -345,6 +359,17 @@ parser.add_argument("--camera-panels", action="store_true")
 parser.add_argument("--image-format", type=str, choices=["jpg", "png"], default="png")
 parser.add_argument("--jpeg-quality", type=int, default=85)
 args, _ = parser.parse_known_args()
+scene_config = default_scene_config(
+    repo_root=REPO_ROOT,
+    robot_usd=args.robot_usd,
+    ee_frame=args.ee_frame,
+    robot_x=args.robot_x,
+    robot_y=args.robot_y,
+    robot_yaw=args.robot_yaw,
+    table_width=args.table_width,
+    table_depth=args.table_depth,
+    cube_size=args.cube_size,
+)
 
 world = World(stage_units_in_meters=1.0)
 stage = world.stage
@@ -530,7 +555,7 @@ initial_target_orientation = np.asarray(target_orientation, dtype=np.float64).co
 last_valid_targets = np.asarray(robot.get_joint_positions(), dtype=np.float32).copy()
 set_translate(target_marker.GetPrim(), target_position)
 set_translate(pointer_marker.GetPrim(), np.array([0.0, 0.0, -10.0], dtype=np.float32))
-status_window, status_model = build_status_window(target_position)
+status_window, status_model, save_status_model = build_status_window(target_position)
 print(f"[SimplePick] tool projection axis: {tool_axis_name}")
 
 target_half_extent_x = pad_size[0] * 0.5
@@ -544,6 +569,7 @@ episode = None
 episode_step_index = 0
 save_executor = concurrent.futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix="episode_save")
 save_futures = []
+last_pending_save_count = 0
 print("[PS5] controls:")
 print("[PS5] left stick -> X/Y")
 print("[PS5] triggers -> Z down/up")
@@ -562,6 +588,16 @@ try:
             else:
                 still_pending.append(future)
         save_futures = still_pending
+        pending_save_count = len(save_futures)
+        if pending_save_count != last_pending_save_count:
+            if pending_save_count > 0:
+                save_status_model.set_value(f"{pending_save_count} pending")
+                print(f"[PS5] saves pending -> {pending_save_count}")
+            else:
+                save_status_model.set_value("idle")
+                if last_pending_save_count > 0:
+                    print("[PS5] saves pending -> 0")
+            last_pending_save_count = pending_save_count
 
         pygame.event.pump()
 
@@ -629,6 +665,9 @@ try:
             print(f"[PS5] gripper toggled -> {'open' if gripper_open else 'closed'}")
         if 2 in buttons and 2 not in last_buttons:
             if not recording:
+                cube_pose = cube.get_world_pose()
+                scene_config["cube"]["start_position"] = np.asarray(cube_pose[0], dtype=np.float32).tolist()
+                scene_config["cube"]["start_orientation_wxyz"] = np.asarray(cube_pose[1], dtype=np.float32).tolist()
                 episode = create_episode_buffer()
                 episode_step_index = 0
                 recording = True
@@ -644,13 +683,15 @@ try:
                         task_name="simple_pick_red_to_blue",
                         source_pad_center=source_pad_center,
                         target_pad_center=target_pad_center,
-                        cube_start=initial_cube_position,
+                        cube_start=np.asarray(scene_config["cube"]["start_position"], dtype=np.float32),
                         ee_frame=args.ee_frame,
                         image_format=args.image_format,
                         jpeg_quality=args.jpeg_quality,
+                        scene_config=copy.deepcopy(scene_config),
                     )
                 )
                 print("[PS5] recording stopped -> saving in background")
+                save_status_model.set_value(f"{len(save_futures)} pending")
                 episode = None
         if 1 in buttons and 1 not in last_buttons:
             if recording:
