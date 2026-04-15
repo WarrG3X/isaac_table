@@ -74,6 +74,7 @@ parser = argparse.ArgumentParser()
 parser.add_argument("--episode-dir", type=str, required=True)
 parser.add_argument("--camera-panels", action="store_true")
 parser.add_argument("--auto-start", action="store_true")
+parser.add_argument("--mode", type=str, choices=["auto", "robot_only", "full_state"], default="auto")
 args = parser.parse_args()
 
 episode_dir = os.path.abspath(args.episode_dir)
@@ -89,6 +90,8 @@ with open(scene_yaml_path, "r", encoding="utf-8") as f:
 episode_data = np.load(data_path)
 joint_positions = np.asarray(episode_data["joint_position"], dtype=np.float32)
 timestamps = np.asarray(episode_data["timestamp"], dtype=np.float64)
+object_positions = np.asarray(episode_data["object_position"], dtype=np.float32) if "object_position" in episode_data else None
+object_orientations = np.asarray(episode_data["object_orientation_wxyz"], dtype=np.float32) if "object_orientation_wxyz" in episode_data else None
 if joint_positions.ndim != 2 or joint_positions.shape[0] == 0:
     raise RuntimeError("Episode has no joint_position trajectory")
 
@@ -136,6 +139,11 @@ if timestamps.shape[0] > 1:
 
 print(f"[Playback] scene={scene_name} episode={episode_dir}")
 print(f"[Playback] frames={joint_positions.shape[0]} dof={joint_positions.shape[1]}")
+full_state_available = object_positions is not None and object_orientations is not None
+playback_mode = args.mode
+if playback_mode == "auto":
+    playback_mode = "full_state" if full_state_available else "robot_only"
+print(f"[Playback] mode={playback_mode}")
 if frame_dt is not None:
     print(f"[Playback] nominal_dt={frame_dt:.4f}s")
 if not args.auto_start:
@@ -152,6 +160,18 @@ try:
                 break
             frame_start = time.perf_counter()
             articulation_controller.apply_action(ArticulationAction(joint_positions=target))
+            if playback_mode == "full_state" and full_state_available:
+                cube = scene_info.extras.get("cube")
+                if cube is not None and object_positions.ndim == 2:
+                    cube.set_world_pose(position=object_positions[idx], orientation=object_orientations[idx])
+                    cube.set_linear_velocity(np.zeros(3, dtype=np.float32))
+                    cube.set_angular_velocity(np.zeros(3, dtype=np.float32))
+                clutter_entries = scene_info.extras.get("clutter_objects", [])
+                if clutter_entries and object_positions.ndim == 3:
+                    for obj_idx, entry in enumerate(clutter_entries):
+                        entry["rigid"].set_world_pose(position=object_positions[idx, obj_idx], orientation=object_orientations[idx, obj_idx])
+                        entry["rigid"].set_linear_velocity(np.zeros(3, dtype=np.float32))
+                        entry["rigid"].set_angular_velocity(np.zeros(3, dtype=np.float32))
             world.step(render=True)
             if args.camera_panels:
                 top_rgba = np.asarray(topdown_sensor_camera.get_rgba(device="cpu"), dtype=np.uint8)

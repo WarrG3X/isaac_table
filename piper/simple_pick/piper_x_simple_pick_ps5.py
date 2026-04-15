@@ -195,6 +195,8 @@ def create_episode_buffer():
         "top_rgb": [],
         "wrist_rgb": [],
         "success": False,
+        "object_position": [],
+        "object_orientation_wxyz": [],
     }
 
 
@@ -235,6 +237,8 @@ def save_episode(output_dir, episode, task_name, source_pad_center, target_pad_c
         ee_delta=np.asarray([step["ee_delta"] for step in episode["steps"]], dtype=np.float32),
         gripper_action=np.asarray([step["gripper_action"] for step in episode["steps"]], dtype=np.int8),
         gripper_open=np.asarray([step["gripper_open"] for step in episode["steps"]], dtype=np.int8),
+        object_position=np.asarray(episode["object_position"], dtype=np.float32),
+        object_orientation_wxyz=np.asarray(episode["object_orientation_wxyz"], dtype=np.float32),
     )
 
     metadata = {
@@ -255,6 +259,7 @@ def save_episode(output_dir, episode, task_name, source_pad_center, target_pad_c
         "image_format": image_ext,
         "data_file": "data.npz",
         "scene_file": "scene.yaml",
+        "playback_mode_default": "full_state",
     }
     with open(os.path.join(episode_dir, "metadata.json"), "w", encoding="utf-8") as f:
         json.dump(metadata, f, indent=2)
@@ -776,8 +781,11 @@ try:
         if args.camera_panels and wrist_rgba.ndim == 3:
             update_camera_provider_from_rgba(robot_provider, wrist_rgba)
         if recording and episode is not None and top_rgba.ndim == 3 and wrist_rgba.ndim == 3:
+            cube_record_pos, cube_record_quat = cube.get_world_pose()
             episode["top_rgb"].append(top_rgba[:, :, :3].copy())
             episode["wrist_rgb"].append(wrist_rgba[:, :, :3].copy())
+            episode["object_position"].append(np.asarray(cube_record_pos, dtype=np.float32).copy())
+            episode["object_orientation_wxyz"].append(np.asarray(cube_record_quat, dtype=np.float32).copy())
             episode["steps"].append(
                 {
                     "step_index": episode_step_index,
