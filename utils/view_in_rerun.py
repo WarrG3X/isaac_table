@@ -12,9 +12,12 @@ Options:
 """
 
 import argparse
+import json
+import time
 from pathlib import Path
 
 import numpy as np
+from PIL import Image
 import rerun as rr
 import rerun.blueprint as rrb
 import torch
@@ -56,25 +59,80 @@ def load_ee_positions(raw_dir: Path) -> np.ndarray | None:
     return None
 
 
+def load_raw_episode(raw_dir: Path) -> dict | None:
+    t0 = time.perf_counter()
+    npz_path = raw_dir / "data.npz"
+    meta_path = raw_dir / "metadata.json"
+    if not npz_path.exists():
+        return None
+    data = np.load(npz_path)
+    metadata = {}
+    if meta_path.exists():
+        metadata = json.loads(meta_path.read_text(encoding="utf-8"))
+    top_dir = raw_dir / "images" / "top"
+    wrist_dir = raw_dir / "images" / "wrist"
+    image_ext = metadata.get("image_format")
+    if image_ext:
+        image_ext = "." + str(image_ext).lstrip(".")
+    elif top_dir.exists():
+        sample = next(top_dir.iterdir(), None)
+        image_ext = sample.suffix if sample else ".png"
+    else:
+        image_ext = ".png"
+    result = {
+        "timestamp": np.asarray(data["timestamp"], dtype=np.float64),
+        "frame_index": np.asarray(data["step_index"], dtype=np.int64),
+        "state": np.asarray(data["joint_position"], dtype=np.float32),
+        "action": np.concatenate(
+            [
+                np.asarray(data["ee_delta"], dtype=np.float32),
+                np.asarray(data["gripper_action"], dtype=np.float32).reshape(-1, 1),
+            ],
+            axis=1,
+        ),
+        "ee_position": np.asarray(data["ee_position"], dtype=np.float32) if "ee_position" in data else None,
+        "top_dir": top_dir,
+        "wrist_dir": wrist_dir,
+        "image_ext": image_ext,
+    }
+    t1 = time.perf_counter()
+    print(f"[RerunView] raw episode loaded in {t1 - t0:.2f}s from {raw_dir}")
+    return result
+
+
 def view(repo_id: str, root: Path, episode_idx: int, raw_dir: Path | None, save_path: Path | None = None):
     from lerobot.datasets.lerobot_dataset import LeRobotDataset
 
+    overall_t0 = time.perf_counter()
+    raw_episode = load_raw_episode(raw_dir) if raw_dir else None
     ds_path = root / repo_id
-    print(f"Loading dataset: {repo_id} (path={ds_path})")
+    print(f"[RerunView] dataset={repo_id}")
+    print(f"[RerunView] dataset_path={ds_path}")
+    print(f"[RerunView] raw_dir={raw_dir if raw_dir else 'none'}")
+    print(f"[RerunView] save_path={save_path if save_path else 'viewer'}")
+    dataset_t0 = time.perf_counter()
     dataset = LeRobotDataset(repo_id=repo_id, root=ds_path)
+    dataset_t1 = time.perf_counter()
+    print(f"[RerunView] LeRobotDataset init took {dataset_t1 - dataset_t0:.2f}s")
 
     # find episode bounds using episode_data_index
+    index_t0 = time.perf_counter()
     ep_start = dataset.episode_data_index["from"][episode_idx].item()
     ep_end = dataset.episode_data_index["to"][episode_idx].item()
     num_frames = ep_end - ep_start
-    print(f"Episode {episode_idx}: {num_frames} frames")
+    index_t1 = time.perf_counter()
+    print(f"[RerunView] episode={episode_idx} frames={num_frames} index_lookup={index_t1 - index_t0:.2f}s")
 
     # load 3D trajectory from raw data
     ee_positions = None
-    if raw_dir:
+    if raw_episode is not None:
+        ee_positions = raw_episode["ee_position"]
+        if ee_positions is not None:
+            print(f"[RerunView] ee_position shape={ee_positions.shape}")
+    elif raw_dir:
         ee_positions = load_ee_positions(raw_dir)
         if ee_positions is not None:
-            print(f"Loaded ee_position trajectory: {ee_positions.shape}")
+            print(f"[RerunView] ee_position shape={ee_positions.shape}")
 
     # --- blueprint layout ---
     blueprint = rrb.Blueprint(
@@ -123,29 +181,45 @@ def view(repo_id: str, root: Path, episode_idx: int, raw_dir: Path | None, save_
             radii=[0.001],
         ), static=True)
 
-    print("Logging to Rerun...")
+    frame_loop_t0 = time.perf_counter()
+    print("[RerunView] begin frame logging")
     for idx in range(ep_start, ep_end):
-        sample = dataset[idx]
-        frame_i = sample["frame_index"].item()
-        timestamp = sample["timestamp"].item()
+        local_i = idx - ep_start
+        if raw_episode is not None:
+            frame_i = int(raw_episode["frame_index"][local_i])
+            timestamp = float(raw_episode["timestamp"][local_i])
+            state = raw_episode["state"][local_i]
+            action = raw_episode["action"][local_i]
+        else:
+            sample = dataset[idx]
+            frame_i = sample["frame_index"].item()
+            timestamp = sample["timestamp"].item()
+            state = sample["observation.state"].numpy()
+            action = sample["action"].numpy()
 
         rr.set_time_sequence("frame", frame_i)
         rr.set_time_seconds("time", timestamp)
 
         # --- images ---
-        if "observation.images.top" in sample:
-            rr.log("camera/top", rr.Image(to_hwc_uint8_numpy(sample["observation.images.top"])))
+        if raw_episode is not None:
+            top_path = raw_episode["top_dir"] / f"{local_i:06d}{raw_episode['image_ext']}"
+            wrist_path = raw_episode["wrist_dir"] / f"{local_i:06d}{raw_episode['image_ext']}"
+            if top_path.exists():
+                rr.log("camera/top", rr.Image(np.asarray(Image.open(top_path))))
+            if wrist_path.exists():
+                rr.log("camera/wrist", rr.Image(np.asarray(Image.open(wrist_path))))
+        else:
+            if "observation.images.top" in sample:
+                rr.log("camera/top", rr.Image(to_hwc_uint8_numpy(sample["observation.images.top"])))
 
-        if "observation.images.wrist" in sample:
-            rr.log("camera/wrist", rr.Image(to_hwc_uint8_numpy(sample["observation.images.wrist"])))
+            if "observation.images.wrist" in sample:
+                rr.log("camera/wrist", rr.Image(to_hwc_uint8_numpy(sample["observation.images.wrist"])))
 
         # --- joint state ---
-        state = sample["observation.state"].numpy()
         for j in range(len(state)):
             rr.log(f"state/joint_{j}", rr.Scalar(float(state[j])))
 
         # --- actions: deltas separate from gripper ---
-        action = sample["action"].numpy()
         rr.log("action/delta/dx", rr.Scalar(float(action[0])))
         rr.log("action/delta/dy", rr.Scalar(float(action[1])))
         rr.log("action/delta/dz", rr.Scalar(float(action[2])))
@@ -158,7 +232,6 @@ def view(repo_id: str, root: Path, episode_idx: int, raw_dir: Path | None, save_
 
         # --- 3D: current EE position as a moving point ---
         if ee_positions is not None:
-            local_i = idx - ep_start
             if local_i < len(ee_positions):
                 pos = ee_positions[local_i]
                 rr.log("trajectory/current", rr.Points3D(
@@ -166,22 +239,26 @@ def view(repo_id: str, root: Path, episode_idx: int, raw_dir: Path | None, save_
                     colors=[[255, 50, 50]],
                     radii=[0.005],
                 ))
-                # trail up to current frame
-                rr.log("trajectory/trail", rr.LineStrips3D(
-                    [ee_positions[:local_i + 1]],
-                    colors=[[255, 100, 100]],
-                    radii=[0.002],
-                ))
 
         if (idx - ep_start + 1) % 100 == 0 or idx == ep_end - 1:
-            print(f"  {idx - ep_start + 1}/{num_frames}")
+            now = time.perf_counter()
+            done = idx - ep_start + 1
+            elapsed = now - frame_loop_t0
+            rate = done / elapsed if elapsed > 0 else 0.0
+            print(f"[RerunView] logged {done}/{num_frames} frames in {elapsed:.2f}s ({rate:.1f} fps)")
 
     if save_path:
+        save_t0 = time.perf_counter()
+        print("[RerunView] begin rrd save")
         rr.save(str(save_path))
-        print(f"Done! Saved to {save_path}")
+        save_t1 = time.perf_counter()
+        print(f"[RerunView] save complete in {save_t1 - save_t0:.2f}s")
+        print(f"[RerunView] saved to {save_path}")
+        print(f"[RerunView] total elapsed {save_t1 - overall_t0:.2f}s")
         print(f"Open with: rerun {save_path}")
     else:
-        print("Done! Rerun viewer should be open.")
+        overall_t1 = time.perf_counter()
+        print(f"[RerunView] viewer logging complete in {overall_t1 - overall_t0:.2f}s")
 
 
 def main():
