@@ -35,7 +35,16 @@ def default_scene_config(repo_root, robot_usd, ee_frame, robot_x, robot_y, robot
         "robot": {"usd_path": os.path.abspath(robot_usd), "x": float(robot_x), "y": float(robot_y), "yaw_deg": float(robot_yaw), "ee_frame": str(ee_frame)},
         "table": {"width": float(table_width), "depth": float(table_depth), "thickness": 0.06, "top_z": table_top_z, "leg_height": 0.72},
         "trays": {"width": float(tray_width), "depth": float(tray_depth), "height": float(tray_height), "wall": float(tray_wall), "source_center": [-0.38, 0.178], "target_center": [0.38, 0.178]},
-        "objects": {"seed": int(seed), "max_volume": float(max_volume), "num_objects": int(num_objects), "asset_root": YCB_AXIS_ALIGNED_DIR, "spawned": []},
+        "objects": {
+            "seed": int(seed),
+            "max_volume": float(max_volume),
+            "num_objects": int(num_objects),
+            "asset_root": YCB_AXIS_ALIGNED_DIR,
+            "spawned": [],
+            "target": {
+                "enabled": False,
+            },
+        },
         "cameras": {"task_center": [0.0, 0.178, table_surface_z], "task_coverage_xy": [abs(0.38 - (-0.38)) + tray_width + 0.24, tray_depth + 0.28], "main_view_eye": [0.0, 2.15, 1.55], "main_view_target": [0.0, 0.20, 0.82]},
         "environment": {
             "name": "simple_room",
@@ -57,15 +66,30 @@ def populate_spawned_objects(config):
     table_surface_z = float(table_cfg["top_z"]) + 0.5 * float(table_cfg["thickness"])
     rng = np.random.default_rng(int(objects_cfg["seed"]))
     ycb_assets = [path for path in list_ycb_assets(objects_cfg["asset_root"]) if (compute_bbox_volume(path) or 0.0) < float(objects_cfg["max_volume"])]
-    selected_count = min(int(objects_cfg["num_objects"]), len(ycb_assets))
-    selected_indices = rng.choice(len(ycb_assets), size=selected_count, replace=False)
+    target_cfg = objects_cfg.get("target", {})
+    target_enabled = bool(target_cfg.get("enabled"))
+    target_usd_path = None
+    target_usd_name = str(target_cfg.get("usd_name", "")).strip()
+    if target_enabled:
+        target_usd_path = target_usd_name
+        if not os.path.isabs(target_usd_path):
+            target_usd_path = os.path.join(objects_cfg["asset_root"], target_usd_name)
+        target_usd_path = os.path.abspath(target_usd_path)
+        if not os.path.exists(target_usd_path):
+            raise FileNotFoundError(f"Target USD not found: {target_usd_path}")
+    random_asset_pool = ycb_assets
+    if target_usd_path is not None:
+        random_asset_pool = [path for path in ycb_assets if os.path.abspath(path) != target_usd_path]
+    selected_count = min(int(objects_cfg["num_objects"]) - (1 if target_enabled else 0), len(random_asset_pool))
+    selected_count = max(selected_count, 0)
+    selected_indices = rng.choice(len(random_asset_pool), size=selected_count, replace=False) if selected_count > 0 else []
     inner_half_x = float(tray_cfg["width"]) * 0.5 - float(tray_cfg["wall"]) - 0.025
     inner_half_y = float(tray_cfg["depth"]) * 0.5 - float(tray_cfg["wall"]) - 0.025
     drop_base_z = table_surface_z + float(tray_cfg["height"]) + 0.08
     source_center = tray_cfg["source_center"]
     spawned = []
     for local_idx, asset_idx in enumerate(selected_indices):
-        usd_path = ycb_assets[int(asset_idx)]
+        usd_path = random_asset_pool[int(asset_idx)]
         x = float(source_center[0] + rng.uniform(-inner_half_x, inner_half_x))
         y = float(source_center[1] + rng.uniform(-inner_half_y, inner_half_y))
         z = float(drop_base_z + 0.06 * local_idx)
@@ -73,7 +97,34 @@ def populate_spawned_objects(config):
         quat = [float(np.cos(np.deg2rad(yaw) * 0.5)), 0.0, 0.0, float(np.sin(np.deg2rad(yaw) * 0.5))]
         bbox_range = compute_bbox_range(usd_path)
         bbox_size = bbox_range.GetSize() if bbox_range is not None else Gf.Vec3d(0.05, 0.05, 0.05)
-        spawned.append({"name": os.path.basename(usd_path), "usd_path": usd_path, "prim_path": f"/World/Clutter/Object_{local_idx}", "initial_position": [x, y, z], "initial_orientation_wxyz": quat, "bbox_size": [float(bbox_size[0]), float(bbox_size[1]), float(bbox_size[2])]})
+        spawned.append({"name": os.path.basename(usd_path), "usd_path": usd_path, "prim_path": f"/World/Clutter/Object_{local_idx}", "initial_position": [x, y, z], "initial_orientation_wxyz": quat, "bbox_size": [float(bbox_size[0]), float(bbox_size[1]), float(bbox_size[2])], "is_target": False})
+    if target_enabled and target_usd_path is not None:
+        corner_name = str(target_cfg.get("corner", "robot_near"))
+        inset_x_frac = float(target_cfg.get("corner_inset_x_fraction", 0.20))
+        inset_y_frac = float(target_cfg.get("corner_inset_y_fraction", 0.20))
+        inset_x = inner_half_x * inset_x_frac
+        inset_y = inner_half_y * inset_y_frac
+        if corner_name == "robot_near":
+            x = float(source_center[0] + inner_half_x - inset_x)
+            y = float(source_center[1] - inner_half_y + inset_y)
+        else:
+            raise ValueError(f"Unsupported target corner: {corner_name}")
+        z = float(drop_base_z + 0.06 * len(spawned))
+        yaw = float(rng.uniform(0.0, 360.0))
+        quat = [float(np.cos(np.deg2rad(yaw) * 0.5)), 0.0, 0.0, float(np.sin(np.deg2rad(yaw) * 0.5))]
+        bbox_range = compute_bbox_range(target_usd_path)
+        bbox_size = bbox_range.GetSize() if bbox_range is not None else Gf.Vec3d(0.05, 0.05, 0.05)
+        spawned.append(
+            {
+                "name": os.path.basename(target_usd_path),
+                "usd_path": target_usd_path,
+                "prim_path": f"/World/Clutter/Object_{len(spawned)}",
+                "initial_position": [x, y, z],
+                "initial_orientation_wxyz": quat,
+                "bbox_size": [float(bbox_size[0]), float(bbox_size[1]), float(bbox_size[2])],
+                "is_target": True,
+            }
+        )
     objects_cfg["spawned"] = spawned
     objects_cfg["bank_size_after_filter"] = len(ycb_assets)
     return config
@@ -176,8 +227,8 @@ def build_scene(world, stage, config):
         add_reference_to_stage(usd_path=entry["usd_path"], prim_path=prim_path)
         auto_generate_convex_colliders(stage.GetPrimAtPath(prim_path))
         rigid = world.scene.add(SingleRigidPrim(prim_path=prim_path, name=f"clutter_object_{idx}", position=np.asarray(entry["initial_position"], dtype=np.float32), orientation=np.asarray(entry["initial_orientation_wxyz"], dtype=np.float32)))
-        clutter_objects.append({"rigid": rigid, "name": entry["name"], "bbox_size": np.asarray(entry["bbox_size"], dtype=np.float32), "initial_position": np.asarray(entry["initial_position"], dtype=np.float32), "initial_orientation": np.asarray(entry["initial_orientation_wxyz"], dtype=np.float32)})
-        object_info.append({"name": entry["name"], "usd_path": entry["usd_path"], "initial_position": list(entry["initial_position"]), "initial_orientation_wxyz": list(entry["initial_orientation_wxyz"]), "bbox_size": list(entry["bbox_size"])})
+        clutter_objects.append({"rigid": rigid, "name": entry["name"], "bbox_size": np.asarray(entry["bbox_size"], dtype=np.float32), "initial_position": np.asarray(entry["initial_position"], dtype=np.float32), "initial_orientation": np.asarray(entry["initial_orientation_wxyz"], dtype=np.float32), "is_target": bool(entry.get("is_target", False))})
+        object_info.append({"name": entry["name"], "usd_path": entry["usd_path"], "initial_position": list(entry["initial_position"]), "initial_orientation_wxyz": list(entry["initial_orientation_wxyz"]), "bbox_size": list(entry["bbox_size"]), "is_target": bool(entry.get("is_target", False))})
 
     set_camera_view(eye=cameras_cfg["main_view_eye"], target=cameras_cfg["main_view_target"], camera_prim_path="/OmniverseKit_Persp")
     if environment_cfg.get("name") == "simple_room":
