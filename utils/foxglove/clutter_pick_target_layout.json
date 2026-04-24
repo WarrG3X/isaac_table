@@ -1,0 +1,148 @@
+{
+  "layout": {
+    "first": {
+      "first": "Image!topcam",
+      "second": "Image!wristcam",
+      "direction": "row",
+      "splitPercentage": 50
+    },
+    "second": {
+      "first": {
+        "first": "Plot!eepos",
+        "second": {
+          "first": "Plot!joints",
+          "second": "Plot!gripper",
+          "direction": "column",
+          "splitPercentage": 50
+        },
+        "direction": "column",
+        "splitPercentage": 34
+      },
+      "second": {
+        "first": {
+          "first": "RawMessages!objects",
+          "second": "RawMessages!jointstate",
+          "direction": "column",
+          "splitPercentage": 50
+        },
+        "second": {
+          "first": "RawMessages!eepose",
+          "second": "RawMessages!metadata",
+          "direction": "column",
+          "splitPercentage": 50
+        },
+        "direction": "column",
+        "splitPercentage": 50
+      },
+      "direction": "row",
+      "splitPercentage": 58
+    },
+    "direction": "column",
+    "splitPercentage": 52
+  },
+  "configById": {
+    "Image!topcam": {
+      "imageMode": {
+        "imageTopic": "/camera/top/image/compressed"
+      }
+    },
+    "Image!wristcam": {
+      "imageMode": {
+        "imageTopic": "/camera/wrist/image/compressed"
+      }
+    },
+    "Plot!eepos": {
+      "paths": [
+        {
+          "value": "/robot/ee_pose.pose.position.x",
+          "label": "ee_x"
+        },
+        {
+          "value": "/robot/ee_pose.pose.position.y",
+          "label": "ee_y"
+        },
+        {
+          "value": "/robot/ee_pose.pose.position.z",
+          "label": "ee_z"
+        }
+      ],
+      "showLegend": true,
+      "isSynced": true,
+      "xAxisVal": "timestamp",
+      "timeWindowMode": "automatic"
+    },
+    "Plot!joints": {
+      "paths": [
+        {
+          "value": "/robot/joint_state.joint_position[0]",
+          "label": "joint1"
+        },
+        {
+          "value": "/robot/joint_state.joint_position[1]",
+          "label": "joint2"
+        },
+        {
+          "value": "/robot/joint_state.joint_position[2]",
+          "label": "joint3"
+        },
+        {
+          "value": "/robot/joint_state.joint_position[3]",
+          "label": "joint4"
+        },
+        {
+          "value": "/robot/joint_state.joint_position[4]",
+          "label": "joint5"
+        },
+        {
+          "value": "/robot/joint_state.joint_position[5]",
+          "label": "joint6"
+        }
+      ],
+      "showLegend": true,
+      "isSynced": true,
+      "xAxisVal": "timestamp",
+      "timeWindowMode": "automatic"
+    },
+    "Plot!gripper": {
+      "paths": [
+        {
+          "value": "/robot/gripper_state.gripper_scalar",
+          "label": "gripper_scalar"
+        },
+        {
+          "value": "/robot/gripper_state.gripper_open",
+          "label": "gripper_open"
+        },
+        {
+          "value": "/robot/gripper_state.gripper_action",
+          "label": "gripper_action"
+        }
+      ],
+      "showLegend": true,
+      "isSynced": true,
+      "xAxisVal": "timestamp",
+      "timeWindowMode": "automatic"
+    },
+    "RawMessages!objects": {
+      "topicPath": "/debug/object_state"
+    },
+    "RawMessages!jointstate": {
+      "topicPath": "/robot/joint_state"
+    },
+    "RawMessages!eepose": {
+      "topicPath": "/robot/ee_pose"
+    },
+    "RawMessages!metadata": {
+      "topicPath": "/metadata/episode"
+    }
+  },
+  "playbackConfig": {
+    "speed": 1,
+    "messageOrder": "receiveTime"
+  },
+  "globalVariables": {},
+  "userNodes": {},
+  "drawerConfig": {},
+  "linkedGlobalVariables": [],
+  "version": 1
+}
