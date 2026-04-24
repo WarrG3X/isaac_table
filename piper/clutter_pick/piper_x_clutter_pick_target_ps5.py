@@ -43,7 +43,7 @@ from scenes.clutter_pick import default_scene_config
 ASSET_ROOT = r"C:\Users\Warra\Downloads\Assets\Isaac\5.1"
 YCB_AXIS_ALIGNED_DIR = os.path.join(ASSET_ROOT, "Isaac", "Props", "YCB", "Axis_Aligned")
 
-TARGET_USD_NAME = "040_large_marker.usd"
+TARGET_USD_NAME = "061_foam_brick.usd"
 TARGET_CORNER_INSET_X_FRACTION = 0.20
 TARGET_CORNER_INSET_Y_FRACTION = 0.20
 TARGET_DROP_HEIGHT_OFFSET_Z = 0.02
@@ -337,7 +337,8 @@ def create_topdown_camera(stage, prim_path, center, coverage_xy):
 def build_status_window(initial_position):
     text_model = ui.SimpleStringModel("")
     save_model = ui.SimpleStringModel("idle")
-    window = ui.Window("Simple Pick Teleop", width=460, height=140, visible=True)
+    gripper_model = ui.SimpleStringModel("1.000")
+    window = ui.Window("Simple Pick Teleop", width=460, height=170, visible=True)
     window.position_x = 40
     window.position_y = 60
     with window.frame:
@@ -350,8 +351,11 @@ def build_status_window(initial_position):
             with ui.HStack(height=24):
                 ui.Label("Saves", width=50)
                 ui.StringField(model=save_model, read_only=True)
+            with ui.HStack(height=24):
+                ui.Label("Grip", width=50)
+                ui.StringField(model=gripper_model, read_only=True)
     text_model.set_value(f"({initial_position[0]:.3f}, {initial_position[1]:.3f}, {initial_position[2]:.3f})")
-    return window, text_model, save_model
+    return window, text_model, save_model, gripper_model
 
 
 def build_camera_window(title, provider, width, height, pos_x, pos_y):
@@ -474,9 +478,11 @@ def save_episode(output_dir, episode, task_name, source_tray_center, target_tray
         timestamp=np.asarray([step["timestamp"] for step in episode["steps"]], dtype=np.float64),
         joint_position=np.asarray([step["joint_position"] for step in episode["steps"]], dtype=np.float32),
         ee_position=np.asarray([step["ee_position"] for step in episode["steps"]], dtype=np.float32),
+        ee_orientation_wxyz=np.asarray([step["ee_orientation_wxyz"] for step in episode["steps"]], dtype=np.float32),
         ee_delta=np.asarray([step["ee_delta"] for step in episode["steps"]], dtype=np.float32),
         gripper_action=np.asarray([step["gripper_action"] for step in episode["steps"]], dtype=np.int8),
         gripper_open=np.asarray([step["gripper_open"] for step in episode["steps"]], dtype=np.int8),
+        gripper_scalar=np.asarray([step["gripper_scalar"] for step in episode["steps"]], dtype=np.float32),
         object_position=np.asarray(episode["object_position"], dtype=np.float32),
         object_orientation_wxyz=np.asarray(episode["object_orientation_wxyz"], dtype=np.float32),
     )
@@ -564,6 +570,16 @@ def ray_aabb_intersection(origin, direction, bounds_min, bounds_max):
     return tmin if tmin >= 0.0 else tmax
 
 
+def compute_gripper_scalar(joint_positions, joint7_idx, gripper_closed_target, gripper_open_target):
+    closed = float(gripper_closed_target[0])
+    opened = float(gripper_open_target[0])
+    span = opened - closed
+    if abs(span) < 1e-6:
+        return 0.0
+    value = (float(joint_positions[joint7_idx]) - closed) / span
+    return float(np.clip(value, 0.0, 1.0))
+
+
 def init_controller(index):
     pygame.init()
     pygame.joystick.init()
@@ -600,9 +616,9 @@ parser.add_argument("--table-width", type=float, default=1.90)
 parser.add_argument("--table-depth", type=float, default=1.55)
 parser.add_argument("--tray-width", type=float, default=0.60)
 parser.add_argument("--tray-depth", type=float, default=0.42)
-parser.add_argument("--tray-height", type=float, default=0.1275)
+parser.add_argument("--tray-height", type=float, default=0.05)
 parser.add_argument("--tray-wall", type=float, default=0.012)
-parser.add_argument("--num-objects", type=int, default=0)
+parser.add_argument("--num-objects", type=int, default=12)
 parser.add_argument("--seed", type=int, default=42)
 parser.add_argument("--max-volume", type=float, default=0.002)
 parser.add_argument("--data-dir", type=str, default=DEFAULT_DATA_DIR)
@@ -992,7 +1008,7 @@ initial_target_orientation = np.asarray(target_orientation, dtype=np.float64).co
 last_valid_targets = np.asarray(robot.get_joint_positions(), dtype=np.float32).copy()
 set_translate(target_marker.GetPrim(), target_position)
 set_translate(pointer_marker.GetPrim(), np.array([0.0, 0.0, -10.0], dtype=np.float32))
-status_window, status_model, save_status_model = build_status_window(target_position)
+status_window, status_model, save_status_model, gripper_model = build_status_window(target_position)
 print(f"[ClutterPickTarget] tool projection axis: {tool_axis_name}")
 
 joystick = init_controller(args.controller)
@@ -1092,6 +1108,14 @@ try:
         target_position[2] = np.clip(target_position[2], table_surface_z + 0.03, 1.35)
         set_translate(target_marker.GetPrim(), target_position)
         status_model.set_value(f"({target_position[0]:.3f}, {target_position[1]:.3f}, {target_position[2]:.3f})")
+        current_joint_positions_for_ui = np.asarray(robot.get_joint_positions(), dtype=np.float32).copy()
+        gripper_scalar_value = compute_gripper_scalar(
+            joint_positions=current_joint_positions_for_ui,
+            joint7_idx=joint7_idx,
+            gripper_closed_target=gripper_closed_target,
+            gripper_open_target=gripper_open_target,
+        )
+        gripper_model.set_value(f"{gripper_scalar_value:.3f}")
 
         gripper_action = 0
         if 0 in buttons and 0 not in last_buttons:
@@ -1190,6 +1214,7 @@ try:
         ee_world_position, ee_world_rotation = art_kinematics.compute_end_effector_pose()
         ee_world_position = np.asarray(ee_world_position, dtype=np.float64)
         ee_world_rotation = np.asarray(ee_world_rotation, dtype=np.float64)
+        ee_world_orientation = normalize_quat_wxyz(rot_matrices_to_quats(ee_world_rotation))
         ray_direction = ee_world_rotation @ tool_local_axis
         best_t = None
         hit_point = None
@@ -1233,6 +1258,7 @@ try:
                 obj_position, obj_orientation = entry["rigid"].get_world_pose()
                 object_positions.append(np.asarray(obj_position, dtype=np.float32))
                 object_orientations.append(np.asarray(obj_orientation, dtype=np.float32))
+            current_joint_positions = current_joint_positions_for_ui.copy()
             episode["top_rgb"].append(top_rgba[:, :, :3].copy())
             episode["wrist_rgb"].append(wrist_rgba[:, :, :3].copy())
             episode["object_position"].append(np.stack(object_positions, axis=0))
@@ -1241,14 +1267,16 @@ try:
                 {
                     "step_index": episode_step_index,
                     "timestamp": time.time(),
-                    "joint_position": np.asarray(robot.get_joint_positions(), dtype=np.float32).copy(),
+                    "joint_position": current_joint_positions,
                     "ee_position": np.asarray(ee_world_position, dtype=np.float32).copy(),
+                    "ee_orientation_wxyz": np.asarray(ee_world_orientation, dtype=np.float32).copy(),
                     "ee_delta": np.array(
                         [delta[0], delta[1], delta[2], rot_delta[0], rot_delta[1], rot_delta[2]],
                         dtype=np.float32,
                     ),
                     "gripper_action": gripper_action,
                     "gripper_open": 1 if gripper_open else 0,
+                    "gripper_scalar": gripper_scalar_value,
                 }
             )
             episode_step_index += 1
