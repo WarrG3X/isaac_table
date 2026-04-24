@@ -44,6 +44,7 @@ DEFAULT_TABLE_DEPTH = 1.55
 DEFAULT_TRAY_WIDTH = 0.60
 DEFAULT_TRAY_DEPTH = 0.42
 DEFAULT_TRAY_HEIGHT = 0.1275
+DEFAULT_DEBUG_TRAY_HEIGHT = 0.035
 DEFAULT_TRAY_WALL = 0.012
 DEFAULT_NUM_OBJECTS = 12
 DEFAULT_SEED = 42
@@ -53,7 +54,7 @@ DEFAULT_ROBOT_Y = -0.05
 DEFAULT_ROBOT_YAW = 0.0
 DEFAULT_EE_FRAME = "link6"
 DEFAULT_PIPER_USD = os.path.join(ISAAC_ROOT, "piper_isaac_sim", "USD", "piper_x_v1.usd")
-TARGET_USD_NAME = "040_large_marker.usd"
+TARGET_USD_NAME = "061_foam_brick.usd"
 TARGET_CORNER_INSET_X_FRACTION = 0.20
 TARGET_CORNER_INSET_Y_FRACTION = 0.20
 TARGET_DROP_HEIGHT_OFFSET_Z = 0.02
@@ -66,7 +67,7 @@ parser.add_argument("--table-width", type=float, default=DEFAULT_TABLE_WIDTH)
 parser.add_argument("--table-depth", type=float, default=DEFAULT_TABLE_DEPTH)
 parser.add_argument("--tray-width", type=float, default=DEFAULT_TRAY_WIDTH)
 parser.add_argument("--tray-depth", type=float, default=DEFAULT_TRAY_DEPTH)
-parser.add_argument("--tray-height", type=float, default=DEFAULT_TRAY_HEIGHT)
+parser.add_argument("--tray-height", type=float, default=DEFAULT_DEBUG_TRAY_HEIGHT)
 parser.add_argument("--tray-wall", type=float, default=DEFAULT_TRAY_WALL)
 parser.add_argument("--num-objects", type=int, default=DEFAULT_NUM_OBJECTS)
 parser.add_argument("--seed", type=int, default=DEFAULT_SEED)
